@@ -1068,6 +1068,9 @@ def process_gateway_files(
     cnb_ids = {_norm(i["utr"]) for i in cnb_all} - {""}
 
     print(f"[DEBUG] auto_bank_brs empty: {auto_bank_brs.empty}")
+    print(f"[DEBUG] auto_bank_brs path: {AUTO_BANK_BRS_FILE.resolve()}")
+    print(f"[DEBUG] auto_bank_brs exists: {AUTO_BANK_BRS_FILE.exists()}")
+    
     if not auto_bank_brs.empty:
         ref_add1 = pd.DataFrame()
         for kw in ["Add:Cheques issued but not debited", "Add: Cheques issued but not debited"]:
@@ -1108,10 +1111,6 @@ def process_gateway_files(
         print(f"[DEBUG] dnc_all  items : {len(dnc_all)}")
         print(f"[DEBUG] less2_all items: {len(less2_all)}")
         print(f"[DEBUG] cnb_all  items : {len(cnb_all)}")
-
-        print(f"[DEBUG] auto_bank_brs path: {AUTO_BANK_BRS_FILE.resolve()}")
-        print(f"[DEBUG] auto_bank_brs exists: {AUTO_BANK_BRS_FILE.exists()}")
-        print(f"[DEBUG] auto_bank_brs empty: {auto_bank_brs.empty}")
         # ── END DEBUG ──
 
         add1_ids  = {_norm(i["utr"]) for i in add1_all} - {""}
