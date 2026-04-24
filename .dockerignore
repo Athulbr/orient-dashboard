@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+.git
+.gitignore
+BANH RECO SAMPLE FOR CHEQUE RETURN 1/
+BRS & Book report-Maraekat & Bank statement/
+Data/
+Gateway/
+Latest_Bank_Reco_Files/
+QR RECO/
+temp.py
