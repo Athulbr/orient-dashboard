@@ -1067,6 +1067,7 @@ def process_gateway_files(
     cnb_all = list(cnb_cf) + [i for i in all_cnb_combined if i["utr"] not in cf_utrs_cnb]
     cnb_ids = {_norm(i["utr"]) for i in cnb_all} - {""}
 
+    print(f"[DEBUG] auto_bank_brs empty: {auto_bank_brs.empty}")
     if not auto_bank_brs.empty:
         ref_add1 = pd.DataFrame()
         for kw in ["Add:Cheques issued but not debited", "Add: Cheques issued but not debited"]:
@@ -1096,6 +1097,18 @@ def process_gateway_files(
         dnc_all   = section_rows_to_items(ref_dnc, "Auto-loaded from bank BRS reference", "REF-DNC", False)
         less2_all = section_rows_to_items(ref_less2, "Auto-loaded from bank BRS reference", "REF-L2", False)
         cnb_all   = section_rows_to_items(ref_cnb, "Auto-loaded from bank BRS reference", "REF-CNB", False)
+
+        # ── DEBUG -- remove after fix ──
+        print(f"[DEBUG] auto_bank_brs loaded: rows={len(auto_bank_brs)}")
+        print(f"[DEBUG] ref_add1 rows : {len(ref_add1)}")
+        print(f"[DEBUG] ref_dnc  rows : {len(ref_dnc)}")
+        print(f"[DEBUG] ref_less2 rows: {len(ref_less2)}")
+        print(f"[DEBUG] ref_cnb  rows : {len(ref_cnb)}")
+        print(f"[DEBUG] add1_all items : {len(add1_all)}")
+        print(f"[DEBUG] dnc_all  items : {len(dnc_all)}")
+        print(f"[DEBUG] less2_all items: {len(less2_all)}")
+        print(f"[DEBUG] cnb_all  items : {len(cnb_all)}")
+        # ── END DEBUG ──
 
         add1_ids  = {_norm(i["utr"]) for i in add1_all} - {""}
         dnc_ids   = {_norm(i["utr"]) for i in dnc_all} - {""}
