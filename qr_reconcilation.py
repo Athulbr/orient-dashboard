@@ -41,8 +41,8 @@ def parse_args():
                    help="QR-HDFC bank statement xlsx")
     p.add_argument("--prev-brs",     required=True,
                    help="Previous day BRS xlsx")
-    p.add_argument("--output",       default="QR_Reconciliation.xlsx",
-                   help="Output workbook path  (default: QR_Reconciliation.xlsx)")
+    p.add_argument("--output",       default="QR_Reconcilation.xlsx",
+                   help="Output workbook path  (default: QR_Reconcilation.xlsx)")
     p.add_argument("--date",         default=None,
                    help="BRS date dd.mm.yyyy; auto-detected from statement filename if omitted")
     return p.parse_args()
