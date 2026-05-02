@@ -1,3 +1,28 @@
+"""
+QR_Reconcilation.py
+====================
+Refactored from qr_reconciliation_merged.py for use as a library.
+
+All logic is unchanged.  The only structural change is:
+  - argparse / top-level execution removed
+  - Everything wrapped in process_qr_files() which is called by app.py
+  - Returns the 9-tuple app.py expects:
+      (matched_df, dnc_df, cnb_df,
+       closing_bal, bank_bal, reconciled,
+       brs_date, books_match, corr_amts)
+
+  Where:
+    matched_df  — DataFrame of matched rows (columns mirror Sheet 3)
+    dnc_df      — DataFrame of DNC items   (columns: date, branch, ref, party, amount, note, cf)
+    cnb_df      — DataFrame of CNB items   (columns: date, branch, rrn, party, amount, remark, cf)
+    closing_bal — float  HOT book closing balance
+    bank_bal    — float  computed bank closing balance after BRS arithmetic
+    reconciled  — bool   abs(bank_bal) < 1
+    brs_date    — str    "dd.mm.yyyy"
+    books_match — bool   all-branches payments == HOT receipts
+    corr_amts   — list   correction amount values detected
+"""
+
 import re
 import sys
 from pathlib import Path
@@ -114,22 +139,54 @@ def normalize_party(text):
     text = str(text or "").replace("INDIVI - ", "").strip()
     return re.sub(r"\s+", " ", text.upper())
 
+def _clean_makez_extracted(name):
+    if not name or str(name).strip().lower() in ("", "nan", "none"):
+        return ""
+    s = str(name).upper().strip()
+    for prefix in ("MR.", "MRS.", "MS.", "DR.", "INDIVI - ", "M/S ", "M/S. "):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+    s = re.sub(r"[^A-Z0-9 ]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
 def _find_section(df, header_fragment, data_col=5):
+    """
+    Dynamically locate a named section in the previous BRS sheet.
+
+    Scans column 0 for a row containing header_fragment (case-insensitive).
+    Collects subsequent rows until data_col becomes non-numeric (subtotal/blank).
+    Also skips rows whose col-0 date is empty (formula/SUM rows pandas reads
+    as numeric).
+
+    Handles output-format section headers which may have extra spaces or
+    slightly different wording (e.g. "Less :  Cheques deposited…" vs
+    "Less: Cheques deposited…").
+    """
+    import re as _re
+    def _norm(s):
+        s = _re.sub(r"\s+", " ", s.strip()).lower()
+        s = _re.sub(r"\s*:\s*", ":", s)   # "less : cheques" → "less:cheques"
+        return s
+    frag_norm = _norm(header_fragment)
+
     rows = []
     in_section = False
     for idx in df.index:
         cell0 = str(df.at[idx, 0]).strip() if pd.notna(df.at[idx, 0]) else ""
         if not in_section:
-            if header_fragment.lower() in cell0.lower():
+            if frag_norm in _norm(cell0):
                 in_section = True
+            continue
+        # Skip the sub-header row that labels the columns (e.g. "Date", "Branch", …)
+        if cell0.strip().lower() in ("date", "sl no", "sl.no.", "sr no", "sr.no."):
             continue
         val = df.at[idx, data_col]
         num = pd.to_numeric(val, errors="coerce")
         if pd.isna(num):
-            break
+            break   # subtotal or blank row — end of section
         date_val = df.at[idx, 0]
         if not pd.notna(date_val) or str(date_val).strip() in ("", "nan"):
-            continue
+            continue  # formula row whose amount pandas read as numeric — skip
         rows.append(idx)
     return df.loc[rows] if rows else df.iloc[0:0]
 
@@ -287,7 +344,36 @@ def process_qr_files(
     stmt_failed  = df_stmt[df_stmt["transaction state"] == "SaleFailed"].copy()
 
     # ── Previous BRS ──────────────────────────────────────────────────────────
-    prev = pd.read_excel(PREV_BRS_FILE, sheet_name="QR-HDFC", header=None)
+    # Auto-detect whether the prev BRS is an output file produced by this script
+    # (contains sheets like "Cheque Deposit", "QR BRS Statement", etc.) or the
+    # original "QR-HDFC" source format. The output format has an extra column
+    # before Amount so _PREV_DATA_COL and sibling column indices must shift.
+    _prev_xl      = pd.ExcelFile(PREV_BRS_FILE)
+    _prev_sheets  = _prev_xl.sheet_names
+    _OUTPUT_SHEET_HINTS = ("CHEQUE DEPOSIT", "BANK GATEWAY", "RECO ITEMS",
+                           "HOT SETTLEMENTS", "QR BRS STATEMENT", "CF AUDIT TRAIL")
+    _is_output_fmt = any(
+        any(s.upper().startswith(h) for h in _OUTPUT_SHEET_HINTS)
+        for s in _prev_sheets
+    )
+    if _is_output_fmt and "QR BRS Statement" in _prev_sheets:
+        print(f"[Prev BRS] Detected output-format file — using 'QR BRS Statement' sheet")
+        prev           = pd.read_excel(PREV_BRS_FILE, sheet_name="QR BRS Statement", header=None)
+        _PREV_DATA_COL = 8   # output format: Date|Branch|BillNo|RRN|ChqNo|BookReport|BankStmt|Makez|Amount|...
+        _PREV_RRN_COL  = 3
+        _PREV_PARTY_COL= 7
+    elif "QR-HDFC" in _prev_sheets:
+        prev           = pd.read_excel(PREV_BRS_FILE, sheet_name="QR-HDFC", header=None)
+        _PREV_DATA_COL = 5   # original format: Date|Branch|RRN|...|Party|Amount|...
+        _PREV_RRN_COL  = 2
+        _PREV_PARTY_COL= 4
+    else:
+        # Fallback: try first sheet
+        prev           = pd.read_excel(PREV_BRS_FILE, sheet_name=0, header=None)
+        _PREV_DATA_COL = 5
+        _PREV_RRN_COL  = 2
+        _PREV_PARTY_COL= 4
+        print(f"[Prev BRS] WARNING: No recognised sheet found — using first sheet: '{_prev_sheets[0]}'")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  STEP 2 — DETECT CORRECTION ENTRIES
@@ -459,6 +545,12 @@ def process_qr_files(
 
                 scores = [name_sim(b_pty, r[name_col]) for r in rows]
                 avg_sc = sum(scores) // len(scores)
+                if any(sc < FUZZY_ACCEPT for sc in scores):
+                    print(f"    SKIP SPLIT x{combo_size}: weak split name match for "
+                          f"{b_br}/{b_pty}/{b_amt} -> "
+                          + " + ".join(f"{r[name_col]}/{int(r['amount(rs.)'])}/score={sc}"
+                                       for r, sc in zip(rows, scores)))
+                    continue
 
                 matched_book.add(bi)
                 for idx in indices:
@@ -525,9 +617,10 @@ def process_qr_files(
     # ══════════════════════════════════════════════════════════════════════════
     #  STEP 4B — CROSS-MATCH: today's DNC new vs prev BRS CNB carry-forwards
     # ══════════════════════════════════════════════════════════════════════════
-    prev_add_raw = _find_section(prev, "Add: Credited in pass book but not debited").copy()
-    prev_add_raw[5] = pd.to_numeric(prev_add_raw[5], errors="coerce")
-    prev_add_raw = prev_add_raw[prev_add_raw[5].notna() & (prev_add_raw[5] > 0)]
+    prev_add_raw = _find_section(prev, "Add: Credited in pass book but not debited",
+                                 data_col=_PREV_DATA_COL).copy()
+    prev_add_raw[_PREV_DATA_COL] = pd.to_numeric(prev_add_raw[_PREV_DATA_COL], errors="coerce")
+    prev_add_raw = prev_add_raw[prev_add_raw[_PREV_DATA_COL].notna() & (prev_add_raw[_PREV_DATA_COL] > 0)]
 
     cnb_cf = []
     for _, r in prev_add_raw.iterrows():
@@ -536,13 +629,13 @@ def process_qr_files(
             dt = pd.to_datetime(dt, dayfirst=True).strftime("%d.%m.%Y")
         except Exception:
             pass
-        diff = r[6] if pd.notna(r[6]) else None
+        diff = r[_PREV_DATA_COL + 1] if pd.notna(r[_PREV_DATA_COL + 1]) else None
         cnb_cf.append({
             "date"  : dt,
             "branch": str(r[1]).strip(),
-            "rrn"   : str(r[2]).strip(),
-            "party" : str(r[4]).strip(),
-            "amount": float(r[5]),
+            "rrn"   : str(r[_PREV_RRN_COL]).strip(),
+            "party" : str(r[_PREV_PARTY_COL]).strip(),
+            "amount": float(r[_PREV_DATA_COL]),
             "diff"  : diff,
             "remark": "Carried Fwd",
             "cf"    : True,
@@ -590,12 +683,44 @@ def process_qr_files(
     dnc_new_remaining = [item for i, item in enumerate(dnc_new) if i not in dnc_new_cleared]
     cnb_cf_remaining  = [item for i, item in enumerate(cnb_cf)  if i not in cnb_cf_cleared]
 
+    # Name mismatches should remain visible in the discrepancy section AND in the
+    # natural BRS sections. Duplicate partial/low names and true amount differences.
+    hard_brs_duplicates = [
+        m for m in matched_rows
+        if m["Name Match"] in ("Partial", "Low") or m["Diff"] != 0
+    ]
+    for m in hard_brs_duplicates:
+        dnc_new_remaining.append({
+            "date"  : m["Book Date"],
+            "branch": m["Book Branch"],
+            "ref"   : m["Book Bill No"],
+            "party" : "INDIVI - " + str(m["Book Party"]).replace("INDIVI - ", ""),
+            "amount": m["Book Amt"],
+            "note"  : m.get("Flags", ""),
+            "remark": m.get("Flags", ""),
+            "cf"    : False,
+        })
+        cnb_new.append({
+            "date"  : m["Bank Date"],
+            "branch": m["Bank Branch"],
+            "rrn"   : str(m["Bank RRN"]),
+            "party" : m["Bank Payer"],
+            "amount": m["Bank Amt"],
+            "diff"  : m["Diff"],
+            "remark": m.get("Flags", ""),
+            "cf"    : False,
+        })
+
+    if hard_brs_duplicates:
+        print(f"  Also showing {len(hard_brs_duplicates)} hard mismatch(es) in DNC/CNB sections")
+
     # ══════════════════════════════════════════════════════════════════════════
     #  STEP 5 — BUILD DNC AND CNB LISTS
     # ══════════════════════════════════════════════════════════════════════════
-    prev_less_raw = _find_section(prev, "Less: Cheques deposited but not Credited").copy()
-    prev_less_raw[5] = pd.to_numeric(prev_less_raw[5], errors="coerce")
-    prev_less_raw = prev_less_raw[prev_less_raw[5].notna() & (prev_less_raw[5] > 0)]
+    prev_less_raw = _find_section(prev, "Less: Cheques deposited but not Credited",
+                                  data_col=_PREV_DATA_COL).copy()
+    prev_less_raw[_PREV_DATA_COL] = pd.to_numeric(prev_less_raw[_PREV_DATA_COL], errors="coerce")
+    prev_less_raw = prev_less_raw[prev_less_raw[_PREV_DATA_COL].notna() & (prev_less_raw[_PREV_DATA_COL] > 0)]
 
     dnc_cf = []
     for _, r in prev_less_raw.iterrows():
@@ -604,15 +729,17 @@ def process_qr_files(
             dt = pd.to_datetime(dt, dayfirst=True).strftime("%d.%m.%Y")
         except Exception:
             pass
-        note   = str(r[7]).strip() if pd.notna(r[7]) and str(r[7]).strip() not in ("nan", "") else ""
-        remark = str(r[8]).strip() if len(r) > 8 and pd.notna(r[8]) and str(r[8]).strip() not in ("nan", "") else ""
-        diff   = r[6] if pd.notna(r[6]) else None
+        note_col   = _PREV_DATA_COL + 1
+        remark_col = _PREV_DATA_COL + 2
+        note   = str(r[note_col]).strip()   if pd.notna(r[note_col])   and str(r[note_col]).strip()   not in ("nan", "") else ""
+        remark = str(r[remark_col]).strip() if len(r) > remark_col and pd.notna(r[remark_col]) and str(r[remark_col]).strip() not in ("nan", "") else ""
+        diff   = r[note_col] if pd.notna(r[note_col]) else None
         dnc_cf.append({
             "date"  : dt,
             "branch": str(r[1]).strip(),
             "ref"   : str(r[2]).strip(),
-            "party" : str(r[4]).strip(),
-            "amount": float(r[5]),
+            "party" : str(r[_PREV_PARTY_COL]).strip(),
+            "amount": float(r[_PREV_DATA_COL]),
             "diff"  : diff,
             "note"  : note,
             "remark": remark,
@@ -623,16 +750,13 @@ def process_qr_files(
     print(f"  DNC CF : {len(dnc_cf)} items  (Rs {sum(i['amount'] for i in dnc_cf):,.0f})")
     print(f"  CNB CF : {len(cnb_cf)} items  (Rs {sum(i['amount'] for i in cnb_cf):,.0f})")
 
-    stmt_all_keys = {(row["branch_code"], row["amount(rs.)"])
-                     for _, row in df_stmt.iterrows()}
     cf_refs = {i["ref"] for i in dnc_cf}
 
     dnc_all_for_brs = list(dnc_cf)
     for item in dnc_new_remaining:
         if item["ref"] not in cf_refs:
-            key = (item["branch"], item["amount"])
-            if key not in stmt_all_keys:
-                dnc_all_for_brs.append(item)
+            item["cf"] = False
+            dnc_all_for_brs.append(item)
 
     dnc_all_for_sheet = list(dnc_cf)
     for item in dnc_new_remaining:
@@ -889,8 +1013,12 @@ def process_qr_files(
     # ── Sheet 7 — QR BRS Statement ────────────────────────────────────────────
     ws7 = wb.create_sheet("QR BRS Statement")
 
+    # 11-column layout: A:Date B:Branch C:Bill No D:RRN E:Chq No
+    #                   F:Book Report G:Bank Statement H:Makez Extracted
+    #                   I:Amount J:Running Bal K:Note / Remark
     for col, w in [("A", 12), ("B", 8), ("C", 16), ("D", 20),
-                   ("E", 10), ("F", 38), ("G", 16), ("H", 16), ("I", 44)]:
+                   ("E", 10), ("F", 28), ("G", 28), ("H", 28),
+                   ("I", 16), ("J", 16), ("K", 44)]:
         ws7.column_dimensions[col].width = w
 
     _HDR   = fill(C_NAVY)
@@ -904,14 +1032,14 @@ def process_qr_files(
     _bdr   = _BR
 
     def _brs_merge(row, text, bg, fnt):
-        ws7.merge_cells(f"A{row}:I{row}")
+        ws7.merge_cells(f"A{row}:K{row}")
         c           = ws7.cell(row, 1)
         c.value     = text
         c.fill      = bg
         c.font      = fnt
         c.border    = _bdr
         c.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        for col in range(2, 10):
+        for col in range(2, 12):
             ws7.cell(row, col).border = _bdr
             ws7.cell(row, col).fill  = bg
 
@@ -936,29 +1064,33 @@ def process_qr_files(
     r7 = 1
 
     _col_hdrs = ["Date", "Branch", "Bill No", "RRN", "Chq No",
-                 "Party / Description", "Amount (Rs)", "Running Bal (Rs)", "Note / Remark"]
+                 "Book Report", "Bank Statement", "Makez Extracted",
+                 "Amount (Rs)", "Running Bal (Rs)", "Note / Remark"]
 
+    # ── Row 1: company name ───────────────────────────────────────────────────
     _brs_merge(r7, "ORIENT EXCHANGE & FINANCIAL SERVICES (P) LTD",
                _HDR, Font(bold=True, color="FFFFFF", name="Arial", size=13))
     ws7.row_dimensions[r7].height = 28
     r7 += 1
 
+    # ── Row 2: bank / account label ──────────────────────────────────────────
     _brs_merge(r7, "QR-HDFC",
                _HDR, Font(bold=True, color="FFFFFF", name="Arial", size=10))
     ws7.row_dimensions[r7].height = 22
     r7 += 1
 
-    ws7.merge_cells(f"A{r7}:E{r7}")
+    # ── Row 3: BRS title + amount column headers ──────────────────────────────
+    ws7.merge_cells(f"A{r7}:G{r7}")
     c           = ws7.cell(r7, 1)
     c.value     = f"Bank Reconciliation Statement As On {BRS_DATE}"
     c.fill      = _HDR
     c.font      = Font(bold=True, color="FFFFFF", name="Arial", size=11)
     c.border    = _bdr
     c.alignment = Alignment(horizontal="left", vertical="center")
-    for col in range(2, 6):
+    for col in range(2, 8):
         ws7.cell(r7, col).border = _bdr
         ws7.cell(r7, col).fill  = _HDR
-    for ci, txt in [(7, "AMOUNT IN RS"), (8, "AMOUNT IN RS"), (9, "")]:
+    for ci, txt in [(9, "AMOUNT IN RS"), (10, "AMOUNT IN RS"), (11, "")]:
         cell           = ws7.cell(r7, ci, txt)
         cell.fill      = _HDR
         cell.font      = Font(bold=True, color="FFFFFF", name="Arial", size=10)
@@ -967,10 +1099,12 @@ def process_qr_files(
     ws7.row_dimensions[r7].height = 20
     r7 += 1
 
+    # ── Row 4: blank ─────────────────────────────────────────────────────────
     ws7.merge_cells(f"A{r7}:I{r7}")
     ws7.row_dimensions[r7].height = 6
     r7 += 1
 
+    # ── Col-header row ────────────────────────────────────────────────────────
     for ci, h in enumerate(_col_hdrs, 1):
         cell           = ws7.cell(r7, ci, h)
         cell.fill      = _SUB
@@ -982,7 +1116,8 @@ def process_qr_files(
 
     ws7.freeze_panes = f"A{r7}"
 
-    def _brs_item(date, branch, ref, rrn="", chq="", party="", amt=0, narr="", is_cf=False):
+    def _brs_item(date, branch, ref, rrn="", chq="", party="", amt=0, narr="",
+                  is_cf=False, book_raw="", bank_raw=""):
         nonlocal r7
         bg = _ITM_CF if is_cf else _ITM
         display_narr = ("Carried Fwd" if is_cf and not narr else
@@ -995,75 +1130,77 @@ def process_qr_files(
             c.font      = _NF
             c.alignment = Alignment(horizontal=halign, vertical="center")
 
-        _s(1, date,   "center")
-        _s(2, branch, "center")
-        _s(3, ref,    "left")
-        _s(4, rrn,    "left")
-        _s(5, chq,    "center")
-        _s(6, party,  "left")
-        _brs_amt(r7, 7, amt, bg, _NF)
-        ws7.cell(r7, 8, "").fill   = bg
-        ws7.cell(r7, 8).border     = _bdr
-        _brs_narr(r7, 9, display_narr, bg)
+        _s(1, date,     "center")
+        _s(2, branch,   "center")
+        _s(3, ref,      "left")      # Bill No
+        _s(4, rrn,      "left")      # RRN
+        _s(5, chq,      "center")    # Chq No
+        _s(6, book_raw, "left")      # Book Report
+        _s(7, bank_raw, "left")      # Bank Statement
+        _s(8, _clean_makez_extracted(party), "left")  # Makez Extracted
+        _brs_amt(r7, 9, amt, bg, _NF)           # Amount
+        ws7.cell(r7, 10, "").fill   = bg        # Running
+        ws7.cell(r7, 10).border     = _bdr
+        _brs_narr(r7, 11, display_narr, bg)     # Note
         ws7.row_dimensions[r7].height = 16
         r7 += 1
 
     def _brs_subtotal(total):
         nonlocal r7
-        ws7.merge_cells(f"A{r7}:F{r7}")
+        ws7.merge_cells(f"A{r7}:H{r7}")
         ws7.cell(r7, 1).fill  = _SUB
         ws7.cell(r7, 1).border = _bdr
-        for col in range(2, 7):
+        for col in range(2, 9):
             ws7.cell(r7, col).border = _bdr
             ws7.cell(r7, col).fill  = _SUB
-        _brs_amt(r7, 7, total, _SUB, _BF)
-        ws7.cell(r7, 8).fill   = _SUB
-        ws7.cell(r7, 8).border = _bdr
-        ws7.cell(r7, 9).fill   = _SUB
-        ws7.cell(r7, 9).border = _bdr
+        _brs_amt(r7, 9, total, _SUB, _BF)
+        ws7.cell(r7, 10).fill   = _SUB
+        ws7.cell(r7, 10).border = _bdr
+        ws7.cell(r7, 11).fill   = _SUB
+        ws7.cell(r7, 11).border = _bdr
         ws7.row_dimensions[r7].height = 16
         r7 += 1
 
     def _brs_running(running_bal):
         nonlocal r7
-        ws7.merge_cells(f"A{r7}:F{r7}")
+        ws7.merge_cells(f"A{r7}:H{r7}")
         ws7.cell(r7, 1).fill  = _SUB
         ws7.cell(r7, 1).border = _bdr
-        for col in range(2, 7):
+        for col in range(2, 9):
             ws7.cell(r7, col).border = _bdr
             ws7.cell(r7, col).fill  = _SUB
-        ws7.cell(r7, 7).fill   = _SUB
-        ws7.cell(r7, 7).border = _bdr
-        _brs_amt(r7, 8, running_bal, _SUB, _BF)
         ws7.cell(r7, 9).fill   = _SUB
         ws7.cell(r7, 9).border = _bdr
+        _brs_amt(r7, 10, running_bal, _SUB, _BF)
+        ws7.cell(r7, 11).fill   = _SUB
+        ws7.cell(r7, 11).border = _bdr
         ws7.row_dimensions[r7].height = 17
         r7 += 1
 
     def _brs_balance(label, bal, bg=None):
         nonlocal r7
         bg = bg or _BAL
-        ws7.merge_cells(f"A{r7}:F{r7}")
+        ws7.merge_cells(f"A{r7}:H{r7}")
         c           = ws7.cell(r7, 1)
         c.value     = label
         c.fill      = bg
         c.font      = Font(bold=True, name="Arial", size=10)
         c.border    = _bdr
         c.alignment = Alignment(horizontal="left", vertical="center")
-        for col in range(2, 7):
+        for col in range(2, 9):
             ws7.cell(r7, col).border = _bdr
             ws7.cell(r7, col).fill  = bg
-        ws7.cell(r7, 7).fill   = bg
-        ws7.cell(r7, 7).border = _bdr
-        _brs_amt(r7, 8, bal, bg, _BF)
         ws7.cell(r7, 9).fill   = bg
         ws7.cell(r7, 9).border = _bdr
+        _brs_amt(r7, 10, bal, bg, _BF)
+        ws7.cell(r7, 11).fill   = bg
+        ws7.cell(r7, 11).border = _bdr
         ws7.row_dimensions[r7].height = 20
         r7 += 1
 
     def _brs_blank():
         nonlocal r7
-        ws7.merge_cells(f"A{r7}:I{r7}")
+        ws7.merge_cells(f"A{r7}:K{r7}")
         ws7.row_dimensions[r7].height = 6
         r7 += 1
 
@@ -1077,18 +1214,18 @@ def process_qr_files(
 
     def _brs_nil():
         nonlocal r7
-        ws7.merge_cells(f"A{r7}:F{r7}")
+        ws7.merge_cells(f"A{r7}:H{r7}")
         c           = ws7.cell(r7, 1, "      -  (Nil)")
         c.fill      = _ITM; c.border = _bdr; c.font = _NF
         c.alignment = Alignment(horizontal="left", vertical="center")
-        for col in range(2, 7):
+        for col in range(2, 9):
             ws7.cell(r7, col).fill  = _ITM
             ws7.cell(r7, col).border = _bdr
-        _brs_amt(r7, 7, "-", _ITM, _NF, fmt="@")
-        ws7.cell(r7, 8).fill   = _ITM
-        ws7.cell(r7, 8).border = _bdr
-        ws7.cell(r7, 9).fill   = _ITM
-        ws7.cell(r7, 9).border = _bdr
+        _brs_amt(r7, 9, "-", _ITM, _NF, fmt="@")
+        ws7.cell(r7, 10).fill   = _ITM
+        ws7.cell(r7, 10).border = _bdr
+        ws7.cell(r7, 11).fill   = _ITM
+        ws7.cell(r7, 11).border = _bdr
         ws7.row_dimensions[r7].height = 16
         r7 += 1
 
@@ -1125,15 +1262,17 @@ def process_qr_files(
     else:
         for item in dnc_all:
             _brs_item(
-                date   = item["date"],
-                branch = item["branch"],
-                ref    = item["ref"],
-                rrn    = "",
-                chq    = 511,
-                party  = item["party"],
-                amt    = item["amount"],
-                narr   = item.get("note", "") or item.get("remark", ""),
-                is_cf  = bool(item.get("cf")),
+                date     = item["date"],
+                branch   = item["branch"],
+                ref      = item["ref"],
+                rrn      = "",
+                chq      = 511,
+                party    = item["party"],
+                amt      = item["amount"],
+                narr     = item.get("note", "") or item.get("remark", ""),
+                is_cf    = bool(item.get("cf")),
+                book_raw = item["party"],   # Book Report: raw book party name
+                bank_raw = "",              # Bank Statement: blank for book-only items
             )
 
     _brs_subtotal(total_dnc)
@@ -1156,15 +1295,17 @@ def process_qr_files(
     else:
         for item in cnb_all:
             _brs_item(
-                date   = item["date"],
-                branch = item["branch"],
-                ref    = "",
-                rrn    = item.get("rrn", ""),
-                chq    = "",
-                party  = item["party"],
-                amt    = item["amount"],
-                narr   = item.get("remark", ""),
-                is_cf  = bool(item.get("cf")),
+                date     = item["date"],
+                branch   = item["branch"],
+                ref      = "",
+                rrn      = item.get("rrn", ""),
+                chq      = "",
+                party    = item["party"],
+                amt      = item["amount"],
+                narr     = item.get("remark", ""),
+                is_cf    = bool(item.get("cf")),
+                book_raw = "",              # Book Report: blank for bank-only items
+                bank_raw = item["party"],   # Bank Statement: raw bank payer name
             )
 
     _brs_subtotal(total_cnb)
@@ -1178,7 +1319,130 @@ def process_qr_files(
                  int(bank_bal), bg=_bal_bg)
     _brs_blank()
 
-    ws7.merge_cells(f"A{r7}:I{r7}")
+    # ── Matched Transactions with Discrepancies ───────────────────────────────
+    # Surfaces any matched pair where name score < 90% or amounts differ,
+    # so an auditor can verify them before sign-off.
+    _disc_rows = [
+        m for m in matched_rows
+        if m["Name Match"] in ("Partial", "Low") or m["Diff"] != 0
+    ]
+
+    if _disc_rows:
+        _n_low      = sum(1 for m in _disc_rows if m["Name Match"] == "Low")
+        _n_partial  = sum(1 for m in _disc_rows if m["Name Match"] == "Partial")
+        _n_amt_diff = sum(1 for m in _disc_rows if m["Diff"] != 0)
+        _type_parts = []
+        if _n_low:      _type_parts.append(f"{_n_low} low name match{'es' if _n_low > 1 else ''}")
+        if _n_partial:  _type_parts.append(f"{_n_partial} partial name match{'es' if _n_partial > 1 else ''}")
+        if _n_amt_diff: _type_parts.append(f"{_n_amt_diff} amount difference{'s' if _n_amt_diff > 1 else ''}")
+        _type_summary = ", ".join(_type_parts)
+
+        # Section banner — dark red, white text
+        _SEC_W = fill("C00000")
+        _brs_merge(
+            r7,
+            f"⚠  Matched Transactions with Discrepancies — Requires Verification  "
+            f"({len(_disc_rows)} items: {_type_summary})",
+            _SEC_W,
+            Font(bold=True, color="FFFFFF", name="Arial", size=10),
+        )
+        ws7.row_dimensions[r7].height = 20
+        r7 += 1
+
+        # Column header row for discrepancy detail
+        _disc_hdrs = [
+            "Book Date", "Book Branch", "Book Bill No", "Book Party",
+            "Book Amt (Rs)", "Bank Date", "Bank Party", "Bank Amt (Rs)", "Flag / Reason",
+        ]
+        for _ci, _h in enumerate(_disc_hdrs, 1):
+            _c = ws7.cell(r7, _ci, _h)
+            _c.fill      = fill("DCE6F1")
+            _c.font      = font(bold=True)
+            _c.border    = _bdr
+            _c.alignment = Alignment(horizontal="center", vertical="center")
+        ws7.row_dimensions[r7].height = 16
+        r7 += 1
+
+        # One detail row per discrepant match
+        for _m in _disc_rows:
+            _nm   = _m["Name Match"]
+            _diff = _m["Diff"]
+            _sc   = _m["Score%"]
+
+            # Row colour: red=Low, peach=Partial, amber=amt-only diff
+            if _nm == "Low":
+                _row_bg = fill("FFC7CE")
+            elif _nm == "Partial":
+                _row_bg = fill("FCE4D6")
+            else:
+                _row_bg = fill("FFEB9C")
+
+            _flag_parts = []
+            if _nm == "Low":
+                _flag_parts.append(
+                    f"LOW NAME MATCH ({_sc}%): "
+                    f"Book='{_m['Book Party']}' vs Bank='{_m['Bank Payer']}' — manual check required"
+                )
+            elif _nm == "Partial":
+                _flag_parts.append(
+                    f"PARTIAL NAME MATCH ({_sc}%): "
+                    f"Book='{_m['Book Party']}' vs Bank='{_m['Bank Payer']}' — confirm same party"
+                )
+            if _diff != 0:
+                _flag_parts.append(
+                    f"AMOUNT DIFFERENCE: Rs{_diff:+,.2f} — "
+                    f"Book Rs{_m['Book Amt']:,.2f} vs Bank Rs{_m['Bank Amt']:,.2f}"
+                )
+            if _m.get("Flags"):
+                for _seg in _m["Flags"].split(" | "):
+                    if _seg and _seg not in " | ".join(_flag_parts):
+                        _flag_parts.append(_seg)
+            _flag_text = " | ".join(dict.fromkeys(filter(None, _flag_parts)))
+
+            _vals = [
+                _m["Book Date"], _m["Book Branch"], _m["Book Bill No"], _m["Book Party"],
+                _m["Book Amt"],
+                _m["Bank Date"], _m["Bank Payer"], _m["Bank Amt"],
+                _flag_text,
+            ]
+            for _ci, _v in enumerate(_vals, 1):
+                _cell = ws7.cell(r7, _ci, _v)
+                _cell.fill      = _row_bg
+                _cell.border    = _bdr
+                _cell.font      = font(bold=False)
+                _cell.alignment = Alignment(
+                    horizontal="right" if _ci in (5, 8) else "left",
+                    vertical="center", wrap_text=True,
+                )
+                if _ci in (5, 8) and isinstance(_v, (int, float)):
+                    _cell.number_format = "#,##0.00"
+            # Fill remaining columns 10 & 11
+            for _ci in (10, 11):
+                _cell = ws7.cell(r7, _ci, "")
+                _cell.fill   = _row_bg
+                _cell.border = _bdr
+            ws7.row_dimensions[r7].height = 16
+            r7 += 1
+
+        # Legend row
+        ws7.merge_cells(f"A{r7}:K{r7}")
+        _leg = ws7.cell(r7, 1,
+            "🔴 Red = Low Name Match (<60%) — manual verification required   "
+            "🟠 Orange = Partial Name Match (60-89%) — confirm same party   "
+            "🟡 Yellow = Amount difference — review and confirm")
+        _leg.fill      = fill("FFF2CC")
+        _leg.font      = Font(name="Arial", size=8, italic=True, color="7F4F00")
+        _leg.border    = _bdr
+        _leg.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        for _col in range(2, 12):
+            ws7.cell(r7, _col).fill   = fill("FFF2CC")
+            ws7.cell(r7, _col).border = _bdr
+        ws7.row_dimensions[r7].height = 16
+        r7 += 1
+        _brs_blank()
+
+    # ── Footer notes ──────────────────────────────────────────────────────────
+    ws7.merge_cells(f"A{r7}:K{r7}")
     ws7.cell(r7, 1,
         f"Gateway Total Credits (SaleSuccess) : Rs {stmt_success['amount(rs.)'].sum():,.2f}"
     ).font      = Font(name="Arial", size=9, color="595959")
@@ -1186,7 +1450,7 @@ def process_qr_files(
     ws7.cell(r7, 1).border    = no_border()
     r7 += 1
 
-    ws7.merge_cells(f"A{r7}:I{r7}")
+    ws7.merge_cells(f"A{r7}:K{r7}")
     ws7.cell(r7, 1,
         "CF = Carried Forward from Previous BRS (outstanding items not yet cleared)"
     ).font      = Font(name="Arial", size=8, italic=True, color="595959")

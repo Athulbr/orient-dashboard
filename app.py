@@ -373,46 +373,72 @@ async def reconcile_qr_endpoint(
     book_only_records = []
     if dnc_df is not None and not dnc_df.empty:
         for _, row in dnc_df.iterrows():
+            raw_party   = str(row.get("party", ""))         # e.g. "INDIVI - VIJETA VIJAYAN"
+            clean_party = raw_party.replace("INDIVI - ", "").strip()  # e.g. "VIJETA VIJAYAN"
+            narr        = str(row.get("note", "") or row.get("remark", "") or "")
+            is_cf       = bool(row.get("cf", False))
+            # Narration mirrors qr_reconcilation.py _brs_item display_narr logic
+            if is_cf and not narr:
+                display_narr = "Carried Fwd"
+            elif is_cf:
+                display_narr = f"CF | {narr}"
+            else:
+                display_narr = narr
             book_only_records.append({
-                "Date":          row.get("date", ""),
-                "Txn Type":      "Public Sale",
-                "Bill No":       row.get("ref", ""),
-                "Chq No":        511,
-                "Branch":        row.get("branch", ""),
-                "Party":         row.get("party", ""),
-                "Direction":     "INFLOW",
-                "Sender":        row.get("party", ""),
-                "Recipient":     "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
-                "Book Amt (Rs)": row.get("amount", 0),
-                "Narration":     row.get("note", ""),
+                "Date":           row.get("date", ""),
+                "Branch":         row.get("branch", ""),
+                "Txn Type":       "Public Sale",
+                "Bill No":        row.get("ref", ""),
+                "RRN":            "",                        # DNC has no RRN
+                "Chq No":         511,
+                "Book Report":    raw_party,                 # e.g. "INDIVI - VIJETA VIJAYAN"
+                "Bank Statement": "",                        # blank — not in bank yet
+                "Party":          clean_party,               # Makez Extracted
+                "Narration":      display_narr,              # e.g. "CF | -2749"
+                "Direction":      "INFLOW",
+                "Sender":         raw_party,
+                "Recipient":      "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
+                "Book Amt (Rs)":  row.get("amount", 0),
                 "Issue": (
                     "Carried Forward from Previous BRS"
-                    if row.get("cf") else row.get("note") or "In Book — NOT yet in Bank Gateway"
+                    if is_cf else narr or "In Book — NOT yet in Bank Gateway"
                 ),
-                "Is CF": bool(row.get("cf", False)),
+                "Is CF": is_cf,
             })
  
     # ── Normalise bank_only (CNB) for the frontend ────────────────────────────
     bank_only_records = []
     if cnb_df is not None and not cnb_df.empty:
         for _, row in cnb_df.iterrows():
+            raw_party = str(row.get("party", ""))
+            remark    = str(row.get("remark", ""))
+            is_cf     = bool(row.get("cf", False))
+            # Narration mirrors qr_reconcilation.py _brs_item display_narr logic
+            if is_cf and not remark:
+                display_narr = "Carried Fwd"
+            elif is_cf:
+                display_narr = f"CF | {remark}"
+            else:
+                display_narr = remark
             bank_only_records.append({
-                "Date":          row.get("date", ""),
-                "Chq No":        row.get("rrn", ""),
-                "Description":   row.get("remark", ""),
-                "Branch":        row.get("branch", ""),
-                "Party":         row.get("party", ""),
-                "Direction":     "INFLOW",
-                "Sender":        row.get("party", ""),
-                "Recipient":     "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
-                "Debit (Rs)":    "",
-                "Credit (Rs)":   row.get("amount", 0),
-                "Bank Amt (Rs)": row.get("amount", 0),
+                "Date":           row.get("date", ""),
+                "Branch":         row.get("branch", ""),
+                "Bill No":        "",                       # CNB has no book bill no
+                "RRN":            str(row.get("rrn", "")),  # bank RRN
+                "Chq No":         "",                       # no cheque number
+                "Book Report":    "",                       # blank — not in book
+                "Bank Statement": raw_party,                # raw bank payer name
+                "Party":          raw_party,                # Makez Extracted (same for CNB)
+                "Narration":      display_narr,             # e.g. "CF | Carried Fwd"
+                "Direction":      "INFLOW",
+                "Sender":         raw_party,
+                "Recipient":      "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
+                "Bank Amt (Rs)":  row.get("amount", 0),
                 "Issue": (
                     "Carried Forward from Previous BRS"
-                    if row.get("cf") else "Bank credit — NOT yet in company book"
+                    if is_cf else "Bank credit — NOT yet in company book"
                 ),
-                "Is CF": bool(row.get("cf", False)),
+                "Is CF": is_cf,
             })
  
     # ── Normalise matched records for the frontend ────────────────────────────
@@ -428,6 +454,7 @@ async def reconcile_qr_endpoint(
                 "Fuzzy Score %":   row.get("Score%", 0) or 0,
                 "Amount Match":    str(row.get("Amount Match", "")),
                 "Book Txn":        "Public Sale",
+                "Book Date":       str(row.get("Book Date", "")),
                 "Book Bill No":    str(row.get("Book Bill No", "")),
                 "Book Chq":        str(row.get("Book Chq No", "")),
                 "Book Party":      str(row.get("Book Party", "")),
@@ -597,11 +624,11 @@ async def reconcile_gateway_endpoint(
             all_branches_path = all_branches_path,
             hot_book_path     = hot_book_path,
             statement_path    = stmt_path,
-            payu_path         = payu_path,
+            payu_paths         = [payu_path],
             output_path       = output_path,
             payu_od_paths     = payu_od_paths,
             cashfree_path     = cashfree_path,
-            easebuzz_path     = easebuzz_path,
+            easebuzz_paths     = [easebuzz_path],
             prev_brs_path     = prev_brs_path,
         )
 
@@ -630,22 +657,24 @@ async def reconcile_gateway_endpoint(
     }
 
     # ── Summary counts ────────────────────────────────────────────────────────
-    total_matched   = sum(len(g["brs_rows"]) for g in gateway_results)
     total_book_only = len(dnc_all)
     total_bank_only = len(cnb_all)
 
     # ── Normalise book_only (DNC) for frontend ────────────────────────────────
     book_only_records = []
     for item in dnc_all:
+        raw_party   = str(item.get("party", ""))
+        clean_party = raw_party.replace("INDIVI - ", "").strip()
         book_only_records.append({
             "Date":          item.get("date", ""),
             "Txn Type":      "Gateway Settlement",
             "Bill No":       item.get("utr", ""),
             "Chq No":        "",
             "Branch":        item.get("branch", ""),
-            "Party":         item.get("party", ""),
+            "Book Report":   raw_party,       # raw: "INDIVI - NAME"
+            "Party":         clean_party,     # clean: "NAME" (Makez Extracted)
             "Direction":     "INFLOW",
-            "Sender":        item.get("party", ""),
+            "Sender":        raw_party,
             "Recipient":     "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
             "Book Amt (Rs)": item.get("amount", 0),
             "Narration":     item.get("remark", ""),
@@ -661,50 +690,95 @@ async def reconcile_gateway_endpoint(
     # ── Normalise bank_only (CNB) for frontend ────────────────────────────────
     bank_only_records = []
     for item in cnb_all:
+        raw_party = str(item.get("party", ""))
+        gw_tag    = "[CF]" if item.get("cf") else f"[{item.get('gateway', '')}]"
         bank_only_records.append({
-            "Date":          item.get("date", ""),
-            "Chq No":        item.get("utr", ""),
-            "Description":   item.get("remark", ""),
-            "Branch":        item.get("branch", ""),
-            "Party":         item.get("party", ""),
-            "Direction":     "INFLOW",
-            "Sender":        item.get("party", ""),
-            "Recipient":     "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
-            "Debit (Rs)":    "",
-            "Credit (Rs)":   item.get("amount", 0),
-            "Bank Amt (Rs)": item.get("amount", 0),
-            "Gateway":       item.get("gateway", ""),
+            "Date":           item.get("date", ""),
+            "Txn Type":       gw_tag,
+            "Bill No":        str(item.get("utr", "")),    # UTR / reference
+            "Chq No":         str(item.get("chq_no", "")),
+            "Book Report":    "",                           # blank — not in book
+            "Bank Statement": raw_party,                    # raw bank party name (= Bank Statement col)
+            "Party":          raw_party,                    # Makez Extracted (same for CNB)
+            "Narration":      item.get("remark", ""),       # e.g. "UNKNOWN CREDIT"
+            "Direction":      "INFLOW",
+            "Sender":         raw_party,
+            "Recipient":      "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
+            "Bank Amt (Rs)":  item.get("amount", 0),
+            "Gateway":        item.get("gateway", ""),
             "Issue": (
                 "Carried Forward from Previous BRS"
-                if item.get("cf")
-                else "Bank credit — NOT yet in company book"
+                if item.get("cf") else "Bank credit — NOT yet in company book"
             ),
             "Is CF": bool(item.get("cf", False)),
         })
 
-    # ── Normalise matched rows for frontend ───────────────────────────────────
+    # ── Normalise matched rows for frontend (from cheque_match_report = Matched sheet) ──
+    import re as _re2
+
+    def _gw_name_flag(rec):
+        verdict = str(rec.get("verdict", "")).upper()
+        score   = int(rec.get("name_score", 0) or 0)
+        if verdict == "MATCHED" or score >= 90: return "Match"
+        if verdict in ("REVIEW", "DNC") or score >= 65: return "Partial"
+        return "Mismatch"
+
+    def _gw_amt_flag(rec):
+        verdict  = str(rec.get("verdict", "")).upper()
+        if verdict == "DNC":       return "DNC"
+        if verdict == "UNMATCHED": return "Missing"
+        bank_amt = float(rec.get("bank_amount", 0) or 0)
+        book_amt = float(rec.get("book_amount", 0) or 0)
+        diff = bank_amt - book_amt
+        return "Exact" if abs(diff) < 1 else f"Diff Rs{diff:+,.2f}"
+
+    def _gw_bank_party(rec):
+        reason = str(rec.get("verdict_reason", "") or "")
+        m = _re2.search(r"'([^']+)'", reason)
+        return m.group(1) if m else str(rec.get("bank_ref", "") or "")
+
     matched_records = []
-    for gw in gateway_results:
-        for row in gw["brs_rows"]:
-            matched_records.append({
-                "Match Method":    gw["name"],
-                "Name Match":      "Match"   if row["Color"] == "GREEN" else "Mismatch",
-                "Fuzzy Score %":   100        if row["Color"] == "GREEN" else 0,
-                "Amount Match":    "Exact"    if abs(row["Difference"]) < 1
-                                             else f"Diff Rs{row['Difference']:+,.2f}",
-                "Book Party":      f"{gw['name']} settlement",
-                "Book Amt (Rs)":   row["Net"],
-                "Bank Party":      row["UTR"],
-                "Bank Amt (Rs)":   row["Bank_Credit"],
-                "Difference (Rs)": round(row["Difference"], 2),
-                "Flags":           row["Status"] if row["Color"] != "GREEN" else "",
-                "Gateway":         gw["name"],
-                "UTR":             row["UTR"],
-                "Gross":           row["Gross"],
-                "Fees":            row["Fees"],
-                "Tax":             row["Tax"],
-                "Credit Type":     row.get("CreditType", ""),
-            })
+    for rec in cheque_match_report:
+        name_flag  = _gw_name_flag(rec)
+        amt_flag   = _gw_amt_flag(rec)
+        bank_party = _gw_bank_party(rec)
+        book_party = str(rec.get("book_party", ""))
+        book_amt   = float(rec.get("book_amount", 0) or 0)
+        bank_amt   = float(rec.get("bank_amount", 0) or 0)
+        diff       = bank_amt - book_amt
+        name_score = int(rec.get("name_score", 0) or 0)
+        verdict    = str(rec.get("verdict", ""))
+
+        matched_records.append({
+            "Match Method":    verdict,
+            "Name Match":      name_flag,
+            "Fuzzy Score %":   name_score,
+            "Amount Match":    amt_flag,
+            "Book Date":       str(rec.get("book_date", "")),
+            "Book Txn":        "Public Sale",
+            "Book Bill No":    str(rec.get("book_bill", "")),
+            "Book Chq":        "511",
+            "Book Party":      book_party,
+            "Book Direction":  "INFLOW",
+            "Book Sender":     book_party,
+            "Book Recipient":  "YES BANK",
+            "Book Amt (Rs)":   book_amt,
+            "Bank Date":       str(rec.get("bank_date", "")),
+            "Bank Chq":        str(rec.get("bank_ref", "")),
+            "Bank Description": bank_party,
+            "Bank Party":      bank_party,
+            "Bank Direction":  "INFLOW" if bank_amt else "",
+            "Bank Sender":     bank_party if bank_amt else "",
+            "Bank Recipient":  "YES BANK" if bank_amt else "",
+            "Debit (Rs)":      "",
+            "Credit (Rs)":     bank_amt if bank_amt else "",
+            "Bank Amt (Rs)":   bank_amt,
+            "Difference (Rs)": round(diff, 2),
+            "Partial Payment": False,
+            "Flags":           str(rec.get("verdict_reason", "")),
+        })
+
+    total_matched   = len(matched_records)  # cheque_match_report rows (= Matched sheet)
 
     # ── Per-gateway summary for frontend ─────────────────────────────────────
     gateway_summary = [
