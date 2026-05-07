@@ -264,13 +264,13 @@ def process_qr_files(
     for _fp, _label in _file_labels.items():
         if not _fp.exists():
             raise FileNotFoundError(
-                f"\n❌  FILE NOT FOUND — {_label}\n"
+                f"\nFILE NOT FOUND — {_label}\n"
                 f"    Expected : {_fp}\n"
                 f"    Please check the path and try again."
             )
         if _fp.suffix.lower() not in (".xlsx", ".xls", ".xlsm", ".ods"):
             raise ValueError(
-                f"\n❌  UNSUPPORTED FILE FORMAT — {_label}\n"
+                f"\nUNSUPPORTED FILE FORMAT — {_label}\n"
                 f"    File     : {_fp}\n"
                 f"    Expected an Excel file (.xlsx / .xls / .xlsm)"
             )
@@ -284,7 +284,7 @@ def process_qr_files(
     try:
         df_all = pd.read_excel(ALL_BRANCHES_FILE, sheet_name=0, header=None)
     except Exception as _e:
-        raise RuntimeError(f"❌  Failed to read All-Branches Book Report\n    File: {ALL_BRANCHES_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"Failed to read All-Branches Book Report\n    File: {ALL_BRANCHES_FILE}\n    Error: {_e}") from _e
 
     SKIP = {"Transaction", "QRHDFC", "Public Sale", "Receipts", "Payments",
             "Summary Of QRHDFC", "nan", ""}
@@ -318,7 +318,7 @@ def process_qr_files(
     try:
         df_hot = pd.read_excel(HOT_QRHDFC_FILE, sheet_name=0, header=None)
     except Exception as _e:
-        raise RuntimeError(f"❌  Failed to read HOT QRHDFC Book Report\n    File: {HOT_QRHDFC_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"Failed to read HOT QRHDFC Book Report\n    File: {HOT_QRHDFC_FILE}\n    Error: {_e}") from _e
 
     hot_rec = df_hot[df_hot[0] == "Receipts"].copy()
     hot_rec["amount"]    = pd.to_numeric(hot_rec[7], errors="coerce").fillna(0)
@@ -354,7 +354,7 @@ def process_qr_files(
     try:
         df_stmt = pd.read_excel(STATEMENT_FILE, sheet_name=0, header=0)
     except Exception as _e:
-        raise RuntimeError(f"❌  Failed to read QR-HDFC Gateway Statement\n    File: {STATEMENT_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"Failed to read QR-HDFC Gateway Statement\n    File: {STATEMENT_FILE}\n    Error: {_e}") from _e
     # Normalise column names to lowercase so both the old format (already
     # lowercase) and the new format (Title Case, e.g. "Transaction Date")
     # are handled transparently.  All subsequent accesses use lowercase keys.
@@ -1245,7 +1245,7 @@ def process_qr_files(
 
         # Flag duplicate RRN in the bank statement itself (not our lookup collision)
         if rrn and str(rrn) in _duplicate_rrns:
-            narration = f"⚠ DUPLICATE RRN IN BANK STMT — {narration}".strip(" —")
+            narration = f"DUPLICATE RRN IN BANK STMT — {narration}".strip(" —")
 
         # Diff cell: show value only when there is an actual difference, else blank
         diff_display = hot_vs_bank_diff if (hot_vs_bank_diff is not None and abs(hot_vs_bank_diff) > 0.005) else None
@@ -1763,7 +1763,7 @@ def process_qr_files(
         _SEC_W = fill("C00000")
         _brs_merge(
             r7,
-            f"⚠  Matched Transactions with Discrepancies — Requires Verification  "
+            f"Matched Transactions with Discrepancies — Requires Verification  "
             f"({len(_disc_rows)} items: {_type_summary})",
             _SEC_W,
             Font(bold=True, color="FFFFFF", name="Calibri", size=10),
@@ -1976,7 +1976,7 @@ def process_qr_files(
          "FULLY RECONCILED" if reconciled else "NOT RECONCILED", ""),
         None,
         # Fix B: surface the stale-CF warning in the Summary sheet.
-        ("⚠ Prev BRS Input Type",
+        ("Prev BRS Input Type",
          "SCRIPT OUTPUT (risk of stale CFs — use manual BRS)" if _is_output_fmt else "Manual BRS (recommended)",
          "Fix B: always supply the MANUAL BRS as prev_brs for clean carry-forwards"),
         ("WRONGLY ACCOUNTED entries excluded",
@@ -2007,7 +2007,7 @@ def process_qr_files(
         # statement as PUNE entries but have no corresponding HOT book entry.
         # These are likely adjustment entries not exported from HOT.
         # They will remain in CNB until the HOT book is corrected.
-        ("⚠ Fix C — Known HOT Data Gap",
+        ("Fix C — Known HOT Data Gap",
          "PUNE PATIL entries (74870 x2) — no HOT book entry found",
          "Manual matched as adjustment entries; cannot auto-match without correct HOT export"),
         None,
