@@ -1419,11 +1419,14 @@ def parse_previous_brs(path, bank_id=None):
         # Detect 10-column BRS layout (Date|Type|Bill|Chq|BookReport|BankStmt|MakézExtracted|Amt|RunBal|Narr)
         # vs 8-column layout (Date|Type|Bill|Chq|Party|Amt|RunBal|Narr).
         # Check by looking at whether col-index 7 in this row holds a numeric amount.
-        _is_10col = len(cells) >= 9 and to_amt(cells[7]) > 0
-        if _is_10col:
-            _amt_col     = 7   # 0-based index 7 = col 8
-            _run_col     = 8   # 0-based index 8 = col 9
-            _narr_col    = 9   # 0-based index 9 = col 10
+        if len(cells) >= 9 and to_amt(cells[7]) > 0:
+            _amt_col     = 7   # default generated layout amount column
+            _run_col     = 8
+            _narr_col    = 9
+        elif len(cells) >= 8 and to_amt(cells[6]) > 0:
+            _amt_col     = 6   # compact book-only/bank-only generated layout
+            _run_col     = 7
+            _narr_col    = 8
         else:
             _amt_col     = 5
             _run_col     = 6
@@ -1438,22 +1441,18 @@ def parse_previous_brs(path, bank_id=None):
             amount = min(candidates) if candidates else max(amounts)
 
         narration = ""
-        if len(cells) > _narr_col and cells[_narr_col] not in ("nan", "", "-"):
+        for c in cells[_amt_col + 1:]:
+            if c in SKIP_WORDS or c in ("nan", "", "-"):
+                continue
+            if to_amt(c) > 0:
+                continue
+            if re.search(r"\d{2}[-/]\d{2}[-/]\d{4}", c) or re.match(r"\d{4}-\d{2}-\d{2}", c):
+                continue
+            if c != party and len(c) > 3:
+                narration = c
+                break
+        if not narration and len(cells) > _narr_col and cells[_narr_col] not in ("nan", "", "-"):
             narration = cells[_narr_col]
-        else:
-            for c in reversed(cells):
-                if c in SKIP_WORDS or c == "":
-                    continue
-                try:
-                    float(c.replace(",", ""))
-                    continue
-                except ValueError:
-                    pass
-                if (c != party and len(c) > 3
-                        and not re.search(r"\d{2}[-/]\d{2}[-/]\d{4}", c)
-                        and not re.match(r"\d{4}-\d{2}-\d{2}", c)):
-                    narration = c
-                    break
 
         clean_party = clean_name(party)
         if current_section in ("debited_not_book", "credited_not_book"):
@@ -4518,14 +4517,80 @@ def reconcile(book_df, stmt_df):
                   f"Rs{b_amt:,.2f} via desc-word match")
     print(f"   -> {len(matched_rows) - p3a_start} matched")
 
-    # ── Pass 3b: Two book INFLOW entries combined = one bank INFLOW entry ─────
-    print("[Reconcile] Pass 3b: Combined book amount -> single bank entry")
+    # Pass 3b: Multiple same-party book entries combined = one bank entry
+    def _amount_cents(value):
+        return int(round(float(value) * 100))
+
+    def _find_amount_subset(idxs, amount_getter, target, min_parts=2):
+        """Return a subset of idxs whose amounts add to target, or None."""
+        target_cents = _amount_cents(target)
+        combos = {0: []}
+        for idx in idxs:
+            amt_cents = _amount_cents(amount_getter(idx))
+            if amt_cents <= 0 or amt_cents > target_cents:
+                continue
+            additions = {}
+            for running, combo in combos.items():
+                new_total = running + amt_cents
+                if new_total > target_cents or new_total in combos or new_total in additions:
+                    continue
+                new_combo = combo + [idx]
+                if new_total == target_cents and len(new_combo) >= min_parts:
+                    return new_combo
+                additions[new_total] = new_combo
+            combos.update(additions)
+        return None
+
+    def _split_party_key(party):
+        key = clean_name(str(party or "")).upper().strip()
+        return key or str(party or "").upper().strip()
+
+    print("[Reconcile] Pass 3b: Combined same-party book amount -> single bank entry")
     p3b_start = len(matched_rows)
     for si, sr in stmt[~stmt["_used"]].iterrows():
-        if sr["Direction"] != "INFLOW": continue
-        cands = book[(~book["_used"]) & (book["Direction"] == "INFLOW")]
+        s_dir = sr["Direction"]
+        cands = book[(~book["_used"]) & (book["Direction"] == s_dir)]
         if len(cands) < 2: continue
         target = float(sr["Bank Amt (Rs)"]); s_date = sr["Date"]; found = False
+        party_groups = {}
+        for bii, br2 in cands.iterrows():
+            if not within_date(br2.get("Date", ""), s_date): continue
+            if _chq_verdict(br2["Chq No"], sr["Chq No"]) == "reject": continue
+            party_groups.setdefault(_split_party_key(br2["Party"]), []).append(bii)
+
+        for _, idxs in party_groups.items():
+            if len(idxs) < 2: continue
+            scores = [fuzzy(book.at[idx, "Party"], sr["Party"]) for idx in idxs]
+            if max(scores) < FUZZY_THRESHOLD: continue  # same-party group must relate to bank party
+            matched_idxs = _find_amount_subset(
+                idxs,
+                lambda idx: book.at[idx, "Book Amt (Rs)"],
+                target,
+                min_parts=2,
+            )
+            if not matched_idxs:
+                continue
+
+            n_parts    = len(matched_idxs)
+            bank_total = float(sr["Bank Amt (Rs)"])
+            bank_dt    = sr["Date"]
+            score      = max(fuzzy(book.at[idx, "Party"], sr["Party"]) for idx in matched_idxs)
+            split_list = " + ".join(
+                f"Rs{float(book.at[idx, 'Book Amt (Rs)']):,.2f}" for idx in matched_idxs
+            )
+            for part_num, idx in enumerate(matched_idxs, 1):
+                part_amt = float(book.at[idx, "Book Amt (Rs)"])
+                note = (f"PARTIAL PAYMENT - Part {part_num} of {n_parts}: "
+                        f"Book Rs{part_amt:,.2f} ({split_list}) = "
+                        f"Bank Rs{bank_total:,.2f} dated {bank_dt} - "
+                        f"confirm all {n_parts} parts are recorded in books")
+                matched_rows.append(_make_row(book.loc[idx], sr, "3b-Party+Combined Amt+Date", score, partial_note=note))
+                book.at[idx, "_used"] = True
+            stmt.at[si, "_used"] = True
+            print(f"[Reconcile] Pass 3b split: {n_parts} '{book.at[matched_idxs[0], 'Party']}' entries = bank Rs{bank_total:,.2f}")
+            found = True
+            break
+        if found: continue
         cidx = list(cands.index)
         for i in range(len(cidx)):
             for j in range(i+1, len(cidx)):
@@ -6117,7 +6182,7 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
         ("  Pass 1: Cheque No exact",              m1,                    "Most reliable"),
         ("  Pass 2: Amount + Direction + Date",    m2,                    "Exact amount, same dir, date ok"),
         ("  Pass 3: Fuzzy Name + Amt + Dir + Date",m3,                    "Name fuzzy-matched"),
-        ("  Pass 3b: Combined Amt + Date",         m3b,                   "Two book entries = one bank entry"),
+        ("  Pass 3b: Combined Amt + Date",         m3b,                   "Multiple book entries = one bank entry"),
         ("  Pass 3c: Split Payment",               m3c,                   "One book entry = two bank entries"),
         ("  Pass 4: Direction-Flip (Forex/FFMC)",  m4,                    "Same amt, opposite dir — forex/settlement"),
         ("  Pass 5: Unmatched (book only)",        len(book_only),        ""),

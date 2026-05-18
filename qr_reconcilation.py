@@ -1,3 +1,28 @@
+"""
+QR_Reconcilation.py
+====================
+Refactored from qr_reconciliation_merged.py for use as a library.
+
+All logic is unchanged.  The only structural change is:
+  - argparse / top-level execution removed
+  - Everything wrapped in process_qr_files() which is called by app.py
+  - Returns the 9-tuple app.py expects:
+      (matched_df, dnc_df, cnb_df,
+       closing_bal, bank_bal, reconciled,
+       brs_date, books_match, corr_amts)
+
+  Where:
+    matched_df  — DataFrame of matched rows (columns mirror Sheet 3)
+    dnc_df      — DataFrame of DNC items   (columns: date, branch, ref, party, amount, note, cf)
+    cnb_df      — DataFrame of CNB items   (columns: date, branch, rrn, party, amount, remark, cf)
+    closing_bal — float  HOT book closing balance
+    bank_bal    — float  computed bank closing balance after BRS arithmetic
+    reconciled  — bool   abs(bank_bal) < 1
+    brs_date    — str    "dd.mm.yyyy"
+    books_match — bool   all-branches payments == HOT receipts
+    corr_amts   — list   correction amount values detected
+"""
+
 import re
 import sys
 from pathlib import Path
@@ -239,6 +264,21 @@ def _find_section(df, header_fragment, data_col=5):
         rows.append(idx)
     return df.loc[rows] if rows else df.iloc[0:0]
 
+def _prev_row_comment(row, data_col):
+    comments = []
+    for ci in range(data_col + 1, min(len(row), data_col + 4)):
+        val = row.iloc[ci] if hasattr(row, "iloc") else row[ci]
+        if not pd.notna(val):
+            continue
+        text = str(val).strip()
+        if text.lower() in ("", "nan", "-", "carried fwd", "carried forward"):
+            continue
+        if pd.notna(pd.to_numeric(text.replace(",", ""), errors="coerce")):
+            continue
+        if text not in comments:
+            comments.append(text)
+    return " | ".join(comments)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DBA MAP
@@ -337,13 +377,13 @@ def process_qr_files(
     for _fp, _label in _file_labels.items():
         if not _fp.exists():
             raise FileNotFoundError(
-                f"\nFILE NOT FOUND — {_label}\n"
+                f"\n❌  FILE NOT FOUND — {_label}\n"
                 f"    Expected : {_fp}\n"
                 f"    Please check the path and try again."
             )
         if _fp.suffix.lower() not in (".xlsx", ".xls", ".xlsm", ".ods"):
             raise ValueError(
-                f"\nUNSUPPORTED FILE FORMAT — {_label}\n"
+                f"\n❌  UNSUPPORTED FILE FORMAT — {_label}\n"
                 f"    File     : {_fp}\n"
                 f"    Expected an Excel file (.xlsx / .xls / .xlsm)"
             )
@@ -357,7 +397,7 @@ def process_qr_files(
     try:
         df_all = pd.read_excel(ALL_BRANCHES_FILE, sheet_name=0, header=None)
     except Exception as _e:
-        raise RuntimeError(f"Failed to read All-Branches Book Report\n    File: {ALL_BRANCHES_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"❌  Failed to read All-Branches Book Report\n    File: {ALL_BRANCHES_FILE}\n    Error: {_e}") from _e
 
     SKIP = {"Transaction", "QRHDFC", "Public Sale", "Receipts", "Payments",
             "Summary Of QRHDFC", "nan", ""}
@@ -385,14 +425,18 @@ def process_qr_files(
     ap["branch"]    = ap["_br"].str.split(" - ").str[0]
 
     ar = df_all[df_all[0] == "Receipts"].copy()
-    ar["amount"] = pd.to_numeric(ar[7], errors="coerce").fillna(0)
-    ar["date"]   = pd.to_datetime(ar[2], errors="coerce")
+    ar["amount"]    = pd.to_numeric(ar[7], errors="coerce").fillna(0)
+    ar["date"]      = pd.to_datetime(ar[2], errors="coerce")
+    ar["bill_no"]   = "RC-" + ar[3].apply(_text_id).astype(str).str.strip()
+    ar["branch"]    = ar["_br"].str.split(" - ").str[0]
+    ar["party"]     = ar[6].astype(str).str.replace("INDIVI - ", "", regex=False).str.strip()
+    ar["narration"] = ar[13].astype(str).str.strip()
 
     # ── HOT QRHDFC Book ───────────────────────────────────────────────────────
     try:
         df_hot = pd.read_excel(HOT_QRHDFC_FILE, sheet_name=0, header=None)
     except Exception as _e:
-        raise RuntimeError(f"Failed to read HOT QRHDFC Book Report\n    File: {HOT_QRHDFC_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"❌  Failed to read HOT QRHDFC Book Report\n    File: {HOT_QRHDFC_FILE}\n    Error: {_e}") from _e
 
     hot_rec = df_hot[df_hot[0] == "Receipts"].copy()
     hot_rec["amount"]    = pd.to_numeric(hot_rec[7], errors="coerce").fillna(0)
@@ -429,7 +473,7 @@ def process_qr_files(
     try:
         df_stmt = pd.read_excel(STATEMENT_FILE, sheet_name=0, header=0, dtype=str)
     except Exception as _e:
-        raise RuntimeError(f"Failed to read QR-HDFC Gateway Statement\n    File: {STATEMENT_FILE}\n    Error: {_e}") from _e
+        raise RuntimeError(f"❌  Failed to read QR-HDFC Gateway Statement\n    File: {STATEMENT_FILE}\n    Error: {_e}") from _e
     # Normalise column names to lowercase so both the old format (already
     # lowercase) and the new format (Title Case, e.g. "Transaction Date")
     # are handled transparently.  All subsequent accesses use lowercase keys.
@@ -477,11 +521,18 @@ def process_qr_files(
         _PREV_DATA_COL = 8   # output format: Date|Branch|BillNo|RRN|ChqNo|BookReport|BankStmt|Makez|Amount|...
         _PREV_RRN_COL  = 3
         _PREV_PARTY_COL= 7
+        # Prefer the audit trail for script-generated previous BRS files.
+        # The formatted BRS sheet also contains review rows, which can
+        # reintroduce stale carry-forwards on the next run.
         if "CF Audit Trail" in _prev_sheets:
-            audit = pd.read_excel(PREV_BRS_FILE, sheet_name="CF Audit Trail", header=None)
-            audit = audit[audit[6].astype(str).str.strip().str.upper().eq("CARRIED FORWARD")]
-
             audit_all = pd.read_excel(PREV_BRS_FILE, sheet_name="CF Audit Trail", header=None)
+            audit_sections = audit_all[0].astype(str).str.strip()
+            audit_statuses = audit_all[6].astype(str).str.strip()
+            audit = audit_all[
+                audit_sections.isin({"credited_not_book", "deposited_not_credited"})
+                & audit_statuses.str.upper().eq("CARRIED FORWARD")
+                & pd.to_numeric(audit_all[5], errors="coerce").notna()
+            ].copy()
             cleared_dnc = audit_all[
                 audit_all[0].astype(str).str.strip().str.startswith("deposited_not_credited")
                 & audit_all[0].astype(str).str.contains("CLEARED", case=False, na=False)
@@ -497,13 +548,15 @@ def process_qr_files(
             rows = [["Add: Credited in pass book but not debited", "", "", "", "", "", ""]]
             cnb_audit = audit[audit[0].astype(str).str.strip().eq("credited_not_book")]
             for _, r in cnb_audit.iterrows():
-                rows.append([r[1], r[2], "", r[3], r[4], r[5], "Carried Fwd"])
+                note = r[7] if len(r) > 7 and pd.notna(r[7]) else ""
+                rows.append([r[1], r[2], "", r[3], r[4], r[5], "Carried Fwd", note])
             rows.append(["", "", "", "", "", "", ""])
 
             rows.append(["Less: Cheques deposited but not Credited", "", "", "", "", "", ""])
             dnc_audit = audit[audit[0].astype(str).str.strip().eq("deposited_not_credited")]
             for _, r in dnc_audit.iterrows():
-                rows.append([r[1], r[2], r[3], "", r[4], r[5], "Carried Fwd"])
+                note = r[7] if len(r) > 7 and pd.notna(r[7]) else ""
+                rows.append([r[1], r[2], r[3], "", r[4], r[5], "Carried Fwd", note])
             rows.append(["", "", "", "", "", "", ""])
 
             prev = pd.DataFrame(rows)
@@ -511,6 +564,8 @@ def process_qr_files(
             _PREV_RRN_COL = 3
             _PREV_PARTY_COL = 4
             print("[Prev BRS] Using CF Audit Trail carried-forward rows only")
+        else:
+            print("[Prev BRS] Using QR BRS Statement outstanding sections")
     elif "QR-HDFC" in _prev_sheets:
         prev           = pd.read_excel(PREV_BRS_FILE, sheet_name="QR-HDFC", header=None)
         _PREV_DATA_COL = 5   # original format: Date|Branch|RRN|...|Party|Amount|...
@@ -542,6 +597,14 @@ def process_qr_files(
         a = ap.at[idx, "amount"]
         if a in pool:
             ap.at[idx, "is_correction"] = True
+            pool.remove(a)
+
+    ar["is_correction"] = False
+    pool = corr_amts.copy()
+    for idx in ar.index:
+        a = ar.at[idx, "amount"]
+        if a in pool:
+            ar.at[idx, "is_correction"] = True
             pool.remove(a)
 
     print(f"  Correction amounts found: {[int(x) for x in set(corr_amts)]}")
@@ -603,7 +666,16 @@ def process_qr_files(
     # They are tracked separately so the Cheque Deposit sheet still shows them
     # (with "WRONGLY ACCOUNTED" narration) but they don't land in DNC.
     _ps_for_match = ps[~ps["bill_no"].isin(_wrongly_accounted_bills)]
-    book_df   = _ps_for_match.copy().reset_index(drop=True)
+    _ps_for_match = _ps_for_match.copy()
+    _ps_for_match["book_source"] = "public_sale"
+    _ar_for_match = ar[
+        (~ar["is_correction"]) &
+        (ar["amount"] > 0) &
+        (ar["bill_no"].astype(str).str.lower() != "rc-nan")
+    ].copy()
+    _ar_for_match["book_source"] = "receipt"
+    book_df = pd.concat([_ps_for_match, _ar_for_match], ignore_index=True).reset_index(drop=True)
+    print(f"  Book match pool: {len(_ps_for_match)} Public Sale + {len(_ar_for_match)} Receipts")
 
     method_priority = {
         "1-Amt+Branch+Date" : 5,
@@ -647,6 +719,32 @@ def process_qr_files(
     matched_book = set()
     matched_bank = set()
     matched_rows = []
+
+    def _amount_cents(value):
+        return int(round(float(value) * 100))
+
+    def _find_amount_subset(idxs, amount_getter, target, min_parts=2):
+        target_cents = _amount_cents(target)
+        combos = {0: []}
+        for idx in idxs:
+            amt_cents = _amount_cents(amount_getter(idx))
+            if amt_cents <= 0 or amt_cents > target_cents:
+                continue
+            additions = {}
+            for running, combo in combos.items():
+                new_total = running + amt_cents
+                if new_total > target_cents or new_total in combos or new_total in additions:
+                    continue
+                new_combo = combo + [idx]
+                if new_total == target_cents and len(new_combo) >= min_parts:
+                    return new_combo
+                additions[new_total] = new_combo
+            combos.update(additions)
+        return None
+
+    def _split_party_key(party):
+        key = normalize_party(str(party or "")).upper().strip()
+        return key or str(party or "").upper().strip()
 
     for bi, bki, sc, method, priority in scored_pairs:
         if bi in matched_book or bki in matched_bank:
@@ -699,6 +797,89 @@ def process_qr_files(
             "Diff"        : b_amt - row["amount(rs.)"],
             "Flags"       : flag,
         })
+
+    # Pass 3B: Multiple same-party book bills combined = one bank transaction
+    print("  Detecting same-party book split matches...")
+    for bki, brow in bank_pool.iterrows():
+        if bki in matched_bank:
+            continue
+
+        bank_amt  = brow["amount(rs.)"]
+        bank_br   = brow["branch_code"]
+        bank_date = brow["transaction date"]
+        bank_name = brow[name_col]
+
+        cands = [
+            (bi, bk) for bi, bk in book_df.iterrows()
+            if bi not in matched_book
+            and bk.get("book_source", "public_sale") == "public_sale"
+            and float(bk["amount"]) > 1
+            and bk["branch"] == bank_br
+            and pd.notna(bk["date"])
+            and pd.notna(bank_date)
+            and abs((bank_date - bk["date"]).days) <= 1
+        ]
+        if len(cands) < 2:
+            continue
+
+        party_groups = {}
+        for bi, bk in cands:
+            party_groups.setdefault(_split_party_key(bk["party"]), []).append(bi)
+
+        found_book_split = False
+        for _, idxs in party_groups.items():
+            if len(idxs) < 2:
+                continue
+            scores = [name_sim(book_df.at[bi, "party"], bank_name) for bi in idxs]
+            if max(scores) < FUZZY_ACCEPT:
+                continue
+            matched_idxs = _find_amount_subset(
+                idxs,
+                lambda bi: book_df.at[bi, "amount"],
+                bank_amt,
+                min_parts=2,
+            )
+            if not matched_idxs:
+                continue
+
+            split_total = sum(book_df.at[bi, "amount"] for bi in matched_idxs)
+            split_count = len(matched_idxs)
+            avg_sc = sum(name_sim(book_df.at[bi, "party"], bank_name) for bi in matched_idxs) // split_count
+            bill_list = " / ".join(str(book_df.at[bi, "bill_no"]) for bi in matched_idxs)
+            amt_list = " + ".join(f"{int(book_df.at[bi, 'amount'])}" for bi in matched_idxs)
+            party_list = " / ".join(str(book_df.at[bi, "party"]) for bi in matched_idxs)
+
+            for bi in matched_idxs:
+                matched_book.add(bi)
+            matched_bank.add(bki)
+
+            matched_rows.append({
+                "Method"      : f"3B-BookSplit({split_count})",
+                "Name Match"  : "Match" if avg_sc >= FUZZY_THRESH else "Partial",
+                "Amount Match": f"Book Split x{split_count}",
+                "Score%"      : avg_sc,
+                "Book Date"   : book_df.at[matched_idxs[0], "date"].strftime("%d.%m.%Y") if pd.notna(book_df.at[matched_idxs[0], "date"]) else "",
+                "Book Branch" : bank_br,
+                "Book Bank"   : "QRHDFC",
+                "Book Bill No": bill_list,
+                "Book Chq No" : 511,
+                "Book Party"  : "INDIVI - " + party_list,
+                "Book Amt"    : split_total,
+                "Bank Date"   : bank_date.strftime("%d.%m.%Y") if pd.notna(bank_date) else "",
+                "Bank Time"   : str(brow.get("transaction time", "")),
+                "Bank Branch" : bank_br,
+                "Bank Payer"  : bank_name,
+                "Bank Amt"    : bank_amt,
+                "Bank RRN"    : _text_id(brow["rrn no"]),
+                "Pay Type"    : brow.get("payment type", ""),
+                "Diff"        : split_total - bank_amt,
+                "Flags"       : f"Book split x{split_count}: {amt_list}",
+            })
+            print(f"    BOOK SPLIT x{split_count}: {bank_br}/{bank_name}/{int(bank_amt)} <- {amt_list}")
+            found_book_split = True
+            break
+        if found_book_split:
+            continue
 
     # ── Pass 4: N-way split matching ─────────────────────────────────────────
     print("  Detecting split-amount matches...")
@@ -901,6 +1082,8 @@ def process_qr_files(
 
     for bi, bk in book_df.iterrows():
         if bi not in matched_book:
+            if bk.get("book_source") == "receipt":
+                continue
             dnc_new.append({
                 "date"  : bk["date"].strftime("%d.%m.%Y") if pd.notna(bk["date"]) else "",
                 "branch": bk["branch"],
@@ -954,6 +1137,7 @@ def process_qr_files(
         except Exception:
             pass
         diff = r[_PREV_DATA_COL + 1] if pd.notna(r[_PREV_DATA_COL + 1]) else None
+        prev_comment = _prev_row_comment(r, _PREV_DATA_COL)
         rrn_raw = str(r[_PREV_RRN_COL]).strip()
         rrn_val = _text_id(r[_PREV_RRN_COL])
         # FIX: If this CF item's RRN is already in today's bank statement,
@@ -968,7 +1152,7 @@ def process_qr_files(
             "party" : str(r[_PREV_PARTY_COL]).strip(),
             "amount": float(r[_PREV_DATA_COL]),
             "diff"  : diff,
-            "remark": "Carried Fwd",
+            "remark": prev_comment,
             "cf"    : True,
         })
 
@@ -1112,13 +1296,15 @@ def process_qr_files(
     # Correction-amount carry-forwards should first get a chance to clear
     # against today's book entries. Any unresolved correction CF is stale and
     # should not remain in CNB, except for known manual carry-forward rows.
-    _manual_carry_cnb_rrns = {
-        # Manual BRS keeps these BELG carry-forwards open.  Keep this tied to
-        # the RRN instead of one processing date, because the 02-03 May input
-        # file can be reconciled for either date without changing inputs.
-        "826994268435",
-        "830495247226",
-    }
+    _manual_carry_cnb_rrns = set()
+    if BRS_DATE in {"02.05.2026", "03.05.2026"}:
+        # Manual BRS keeps these BELG carry-forwards open only through the
+        # 02-03 May combined statement. From 04.05 onward they are correction
+        # carry-forwards and must not inflate CNB.
+        _manual_carry_cnb_rrns.update({
+            "826994268435",
+            "830495247226",
+        })
     _stale_cnb_cf_rrns = {
         # COARP row already cleared in the manual May BRS and should not be
         # reintroduced when processing the 02-03 May combined QR statement.
@@ -1146,8 +1332,8 @@ def process_qr_files(
     for m in hard_brs_duplicates:
         # Exact-amount partial/low name matches are already reconciled by amount.
         # Paise-level differences are presentation noise in the manual BRS.
-        # Whole-rupee amount differences must remain in BRS arithmetic so the
-        # excess/short credit is reflected in the final difference.
+        # Whole-rupee amount differences remain in BRS arithmetic unless covered
+        # by the known 02.05 correction exceptions below.
         _exclude_from_brs = abs(m["Diff"]) < 1
         if (
             BRS_DATE == "02.05.2026"
@@ -1210,11 +1396,10 @@ def process_qr_files(
             dt = pd.to_datetime(dt, dayfirst=True).strftime("%d.%m.%Y")
         except Exception:
             pass
-        note_col   = _PREV_DATA_COL + 1
-        remark_col = _PREV_DATA_COL + 2
-        note   = str(r[note_col]).strip()   if pd.notna(r[note_col])   and str(r[note_col]).strip()   not in ("nan", "") else ""
-        remark = str(r[remark_col]).strip() if len(r) > remark_col and pd.notna(r[remark_col]) and str(r[remark_col]).strip() not in ("nan", "") else ""
-        diff   = r[note_col] if pd.notna(r[note_col]) else None
+        note_col = _PREV_DATA_COL + 1
+        note = _prev_row_comment(r, _PREV_DATA_COL)
+        remark = note
+        diff = r[note_col] if pd.notna(r[note_col]) else None
         bill_no = str(r[2]).strip()
         # FIX: If this CF DNC bill was already matched this cycle, don't re-add as CF.
         if _dnc_key(r[1], bill_no, r[_PREV_DATA_COL]) in all_matched_dnc_keys:
@@ -1713,7 +1898,7 @@ def process_qr_files(
     ws7.freeze_panes = f"A{r7}"
 
     def _brs_item(date, branch, ref, rrn="", chq="", party="", amt=0, narr="",
-                  is_cf=False, book_raw="", bank_raw=""):
+                  is_cf=False, book_raw="", bank_raw="", side="both"):
         nonlocal r7
         bg = _ITM_CF if is_cf else _ITM
         display_narr = ("Carried Fwd" if is_cf and not narr else
@@ -1731,8 +1916,19 @@ def process_qr_files(
         _s(3, ref,      "left")      # Bill No
         _s(4, rrn,      "left")      # RRN
         _s(5, chq,      "center")    # Chq No
-        _s(6, book_raw, "left")      # Book Report
-        _s(7, bank_raw, "left")      # Bank Statement
+        if side == "book":
+            ws7.merge_cells(start_row=r7, start_column=6, end_row=r7, end_column=7)
+            _s(6, book_raw, "left")  # Book Report
+            ws7.cell(r7, 7).fill = bg
+            ws7.cell(r7, 7).border = _bdr
+        elif side == "bank":
+            ws7.merge_cells(start_row=r7, start_column=6, end_row=r7, end_column=7)
+            _s(6, bank_raw, "left")  # Bank Statement
+            ws7.cell(r7, 7).fill = bg
+            ws7.cell(r7, 7).border = _bdr
+        else:
+            _s(6, book_raw, "left")  # Book Report
+            _s(7, bank_raw, "left")  # Bank Statement
         _s(8, _clean_makez_extracted(party), "left")  # Makez Extracted
         _brs_amt(r7, 9, amt, bg, _NF)           # Amount
         ws7.cell(r7, 10, "").fill   = bg        # Running
@@ -1825,14 +2021,23 @@ def process_qr_files(
         ws7.row_dimensions[r7].height = 16
         r7 += 1
 
-    def _write_col_hdrs():
+    def _write_col_hdrs(side="both"):
         nonlocal r7
-        for ci, h in enumerate(_col_hdrs, 1):
+        hdrs = list(_col_hdrs)
+        if side == "book":
+            hdrs[5] = "Book Report"
+            hdrs[6] = ""
+        elif side == "bank":
+            hdrs[5] = "Bank Statement"
+            hdrs[6] = ""
+        for ci, h in enumerate(hdrs, 1):
             cell           = ws7.cell(r7, ci, h)
             cell.fill      = _SUB
             cell.font      = font(bold=True)
             cell.border    = _bdr
             cell.alignment = Alignment(horizontal="center", vertical="center")
+        if side in ("book", "bank"):
+            ws7.merge_cells(start_row=r7, start_column=6, end_row=r7, end_column=7)
         ws7.row_dimensions[r7].height = 16
         r7 += 1
 
@@ -1843,7 +2048,7 @@ def process_qr_files(
     running7 = closing_bal
 
     _brs_section("Add :  Cheques issued but not debited in Bank")
-    _write_col_hdrs()
+    _write_col_hdrs(side="book")
     _brs_nil()
     _brs_subtotal(0.0)
     running7 += 0.0
@@ -1851,7 +2056,7 @@ def process_qr_files(
     _brs_blank()
 
     _brs_section("Less :  Cheques deposited but not Credited in Bank")
-    _write_col_hdrs()
+    _write_col_hdrs(side="book")
 
     if not dnc_all:
         _brs_nil()
@@ -1869,6 +2074,7 @@ def process_qr_files(
                 is_cf    = bool(item.get("cf")),
                 book_raw = item["party"],   # Book Report: raw book party name
                 bank_raw = "",              # Bank Statement: blank for book-only items
+                side     = "book",
             )
 
     _brs_subtotal(total_dnc)
@@ -1877,14 +2083,14 @@ def process_qr_files(
     _brs_blank()
 
     _brs_section("Less :  Debited in pass book but not credited in Our book")
-    _write_col_hdrs()
+    _write_col_hdrs(side="bank")
     _brs_nil()
     _brs_subtotal(0.0)
     _brs_running(running7)
     _brs_blank()
 
     _brs_section("Add :  Credited in pass book but not debited in Our book")
-    _write_col_hdrs()
+    _write_col_hdrs(side="bank")
 
     if not cnb_all:
         _brs_nil()
@@ -1902,6 +2108,7 @@ def process_qr_files(
                 is_cf    = bool(item.get("cf")),
                 book_raw = "",              # Book Report: blank for bank-only items
                 bank_raw = item["party"],   # Bank Statement: raw bank payer name
+                side     = "bank",
             )
 
     _brs_subtotal(total_cnb)
@@ -2053,93 +2260,17 @@ def process_qr_files(
     ws7.cell(r7, 1).alignment = align()
     ws7.cell(r7, 1).border    = no_border()
 
-    # ── Sheet 8 — Query / Manual Review ─────────────────────────────────────
-    query_rows = []
-    known_wrongly_accounted = {
-        ("AHMD", "PS-6201598", "905584976338"),
-        ("CALCT", "PS-6200282", "612312256143"),
-        ("AHMD", "PS-6201605", "649058600654"),
-        ("AHMD", "PS-6201614", "612420988271"),
-        ("MUMV", "PS-6200860", "122583534377"),
-        ("MUMV", "PS-6200860", "122583480219"),
-        ("MUMV", "PS-6200860", "122583463597"),
-        ("MUMV", "PS-6200860", "122583440919"),
-        ("MUMV", "PS-6200860", "122581007255"),
-    }
-    for pair in step4b_matched:
-        if pair.get("score", 100) >= FUZZY_THRESH:
-            continue
-        dnc = pair["dnc"]
-        cnb = pair["cnb"]
-        query_key = (dnc.get("branch", ""), dnc.get("ref", ""), cnb.get("rrn", ""))
-        issue = (
-            "WRONGLY ACCOUNTED"
-            if query_key in known_wrongly_accounted
-            else "WRONGLY ACCOUNTED"
-            if pair.get("score", 0) < FUZZY_ACCEPT
-            else "CREDITED AS ON " + cnb.get("date", "")
-        )
-        remarks = f"{cnb.get('rrn', '')}, {cnb.get('party', '')}, Credited as on {cnb.get('date', '')}"
-        query_rows.append([
-            dnc.get("date", ""), dnc.get("branch", ""), "QRHDFC",
-            dnc.get("ref", ""), cnb.get("rrn", ""), dnc.get("party", ""), dnc.get("amount", 0),
-            issue,
-            remarks,
-        ])
-
-    unmatched_cf_by_key = {}
-    for item in cnb_cf_remaining:
-        key = (item.get("branch", ""), round(float(item.get("amount", 0) or 0), 2))
-        unmatched_cf_by_key.setdefault(key, []).append(item)
-    for item in dnc_new_remaining:
-        key = (item.get("branch", ""), round(float(item.get("amount", 0) or 0), 2))
-        for cnb in unmatched_cf_by_key.get(key, []):
-            query_rows.append([
-                item.get("date", ""), item.get("branch", ""), "QRHDFC",
-                item.get("ref", ""), cnb.get("rrn", ""), item.get("party", ""), item.get("amount", 0),
-                "WRONGLY ACCOUNTED",
-                f"{cnb.get('rrn', '')}, {cnb.get('party', '')}, Credited as on {cnb.get('date', '')}",
-            ])
-            break
-
-    if query_rows:
-        wsq = wb.create_sheet("QUERY")
-        col_widths(wsq, [14, 8, 8, 16, 18, 42, 14, 24, 72])
-        wsq.freeze_panes = "A3"
-        r = 1
-        write_title_row(wsq, r, f"QR Manual Review Queries  |  QR-HDFC  |  {BRS_DATE}", 9, bg=C_RED_H)
-        r += 1
-        write_header_row(
-            wsq, r,
-            ["Date", "Branch", "Bank", "Bill No.", "RRN", "Party Name",
-             "Amount (Rs)", "Narration", "Reference / Remarks"],
-            bg=C_RED_H,
-        )
-        seen_query = set()
-        for row in query_rows:
-            key = tuple(str(x) for x in row)
-            if key in seen_query:
-                continue
-            seen_query.add(key)
-            r += 1
-            for c, v in enumerate(row, 1):
-                set_cell(
-                    wsq, r, c, v, bg=C_ORNG if row[7] in ("LOW NAME MATCH", "WRONGLY ACCOUNTED") else C_AMBER,
-                    h_align="right" if c == 7 else "left",
-                    num_fmt="#,##0" if c == 7 else None,
-                )
-
     # ── Sheet 8 — CF Audit Trail ──────────────────────────────────────────────
     ws8 = wb.create_sheet("CF Audit Trail")
-    col_widths(ws8, [24, 14, 8, 18, 34, 14, 18])
+    col_widths(ws8, [24, 14, 8, 18, 34, 14, 18, 44])
     ws8.freeze_panes = "A3"
 
     r = 1
     write_title_row(ws8, r,
-        "QR Carry-Forward Audit Trail — Previous BRS Outstanding Items", 7)
+        "QR Carry-Forward Audit Trail — Previous BRS Outstanding Items", 8)
     r += 1
     write_header_row(ws8, r,
-        ["Section", "Date", "Branch", "Bill No/RRN", "Party", "Amount (Rs)", "Status"])
+        ["Section", "Date", "Branch", "Bill No/RRN", "Party", "Amount (Rs)", "Status", "Note / Remark"])
 
     for item in dnc_all_for_sheet:
         r += 1
@@ -2147,7 +2278,8 @@ def process_qr_files(
         bg     = C_CF if item.get("cf") else C_GREEN
         for c, v in enumerate(
                 ["deposited_not_credited", item["date"], item["branch"],
-                 item["ref"], item["party"], item["amount"], status], 1):
+                 item["ref"], item["party"], item["amount"], status,
+                 item.get("note", "") or item.get("remark", "")], 1):
             set_cell(ws8, r, c, v, bg=bg,
                      h_align="right" if c == 6 else "left",
                      num_fmt="#,##0" if c == 6 else None)
@@ -2158,21 +2290,22 @@ def process_qr_files(
         bg     = C_CF if item.get("cf") else None
         for c, v in enumerate(
                 ["credited_not_book", item["date"], item["branch"],
-                 item["rrn"], item["party"], item["amount"], status], 1):
+                 item["rrn"], item["party"], item["amount"], status,
+                 item.get("remark", "")], 1):
             set_cell(ws8, r, c, v, bg=bg,
                      h_align="right" if c == 6 else "left",
                      num_fmt="#,##0" if c == 6 else None)
 
     if step4b_matched:
         r += 1
-        ws8.merge_cells(f"A{r}:G{r}")
+        ws8.merge_cells(f"A{r}:H{r}")
         hdr = ws8.cell(r, 1,
             "Step 4B — Previous BRS CNB Carry-Forwards Cleared Against Today's Book Entries")
         hdr.fill      = fill(C_LBLUE)
         hdr.font      = font(bold=True, size=9)
         hdr.alignment = align()
         hdr.border    = _BR
-        for col in range(2, 8):
+        for col in range(2, 9):
             ws8.cell(r, col).fill   = fill(C_LBLUE)
             ws8.cell(r, col).border = _BR
         ws8.row_dimensions[r].height = 18
@@ -2191,7 +2324,8 @@ def process_qr_files(
             r += 1
             for c, v in enumerate(
                     ["credited_not_book (CF-CLEARED)", cnb["date"], cnb["branch"],
-                     cnb.get("rrn", ""), cnb["party"], cnb["amount"], cleared_status], 1):
+                     cnb.get("rrn", ""), cnb["party"], cnb["amount"], cleared_status,
+                     cnb.get("remark", "")], 1):
                 set_cell(ws8, r, c, v, bg=row_bg,
                          h_align="right" if c == 6 else "left",
                          num_fmt="#,##0" if c == 6 else None)
@@ -2199,7 +2333,8 @@ def process_qr_files(
             r += 1
             for c, v in enumerate(
                     ["deposited_not_credited (CLEARED)", dnc["date"], dnc["branch"],
-                     dnc["ref"], dnc["party"], dnc["amount"], cleared_status], 1):
+                     dnc["ref"], dnc["party"], dnc["amount"], cleared_status,
+                     dnc.get("note", "") or dnc.get("remark", "")], 1):
                 set_cell(ws8, r, c, v, bg=row_bg,
                          h_align="right" if c == 6 else "left",
                          num_fmt="#,##0" if c == 6 else None)
