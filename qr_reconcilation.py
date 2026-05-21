@@ -1,28 +1,3 @@
-"""
-QR_Reconcilation.py
-====================
-Refactored from qr_reconciliation_merged.py for use as a library.
-
-All logic is unchanged.  The only structural change is:
-  - argparse / top-level execution removed
-  - Everything wrapped in process_qr_files() which is called by app.py
-  - Returns the 9-tuple app.py expects:
-      (matched_df, dnc_df, cnb_df,
-       closing_bal, bank_bal, reconciled,
-       brs_date, books_match, corr_amts)
-
-  Where:
-    matched_df  — DataFrame of matched rows (columns mirror Sheet 3)
-    dnc_df      — DataFrame of DNC items   (columns: date, branch, ref, party, amount, note, cf)
-    cnb_df      — DataFrame of CNB items   (columns: date, branch, rrn, party, amount, remark, cf)
-    closing_bal — float  HOT book closing balance
-    bank_bal    — float  computed bank closing balance after BRS arithmetic
-    reconciled  — bool   abs(bank_bal) < 1
-    brs_date    — str    "dd.mm.yyyy"
-    books_match — bool   all-branches payments == HOT receipts
-    corr_amts   — list   correction amount values detected
-"""
-
 import re
 import sys
 from pathlib import Path
@@ -43,6 +18,7 @@ if hasattr(sys.stdout, "reconfigure"):
 # ══════════════════════════════════════════════════════════════════════════════
 FUZZY_THRESH = 90
 FUZZY_ACCEPT = 60
+PARTY_CONFIRMATION_THRESHOLD = 50
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATE UTILITY
@@ -432,6 +408,27 @@ def process_qr_files(
     ar["party"]     = ar[6].astype(str).str.replace("INDIVI - ", "", regex=False).str.strip()
     ar["narration"] = ar[13].astype(str).str.strip()
 
+    def _is_brs_display_receipt(row):
+        text = " ".join([
+            str(row.get("party", "")),
+            str(row.get("narration", "")),
+            str(row.get("branch", "")),
+        ]).upper()
+        return "ZEROISE" in text
+
+    def _receipt_brs_display_item(row):
+        return {
+            "date"  : row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else "",
+            "branch": row["branch"],
+            "ref"   : row["bill_no"],
+            "party" : "INDIVI - " + row["party"],
+            "amount": row["amount"],
+            "note"  : "All-Branches Receipt entry shown in BRS only",
+            "remark": "All-Branches Receipt entry shown in BRS only",
+            "source": "receipt",
+            "exclude_from_brs": True,
+        }
+
     # ── HOT QRHDFC Book ───────────────────────────────────────────────────────
     try:
         df_hot = pd.read_excel(HOT_QRHDFC_FILE, sheet_name=0, header=None)
@@ -608,6 +605,15 @@ def process_qr_files(
             pool.remove(a)
 
     print(f"  Correction amounts found: {[int(x) for x in set(corr_amts)]}")
+
+    _receipt_brs_only = ar[
+        (ar["is_correction"]) &
+        (ar["amount"] > 0) &
+        (ar["bill_no"].astype(str).str.lower() != "rc-nan") &
+        (ar.apply(_is_brs_display_receipt, axis=1))
+    ].copy()
+    if not _receipt_brs_only.empty:
+        print(f"  Receipt entries shown in BRS only: {len(_receipt_brs_only)}")
 
     # Previous CNB rows can represent credits that were already in bank and
     # are only waiting for the book entry. Keep these handy before Pass 5 so
@@ -1082,16 +1088,17 @@ def process_qr_files(
 
     for bi, bk in book_df.iterrows():
         if bi not in matched_book:
-            if bk.get("book_source") == "receipt":
-                continue
+            is_receipt_entry = bk.get("book_source") == "receipt"
             dnc_new.append({
                 "date"  : bk["date"].strftime("%d.%m.%Y") if pd.notna(bk["date"]) else "",
                 "branch": bk["branch"],
                 "ref"   : bk["bill_no"],
                 "party" : "INDIVI - " + bk["party"],
                 "amount": bk["amount"],
-                "note"  : "",
-                "remark": "",
+                "note"  : "All-Branches Receipt entry shown for reco only" if is_receipt_entry else "",
+                "remark": "All-Branches Receipt entry shown for reco only" if is_receipt_entry else "",
+                "source": bk.get("book_source", "public_sale"),
+                "exclude_from_brs": is_receipt_entry,
             })
 
     for bki, brow in bank_pool.iterrows():
@@ -1291,6 +1298,22 @@ def process_qr_files(
         skipped = before - len(dnc_new_remaining)
         if skipped:
             print(f"  [CF-SKIP] {skipped} DNC row(s) already cleared in previous output BRS")
+
+    if not _receipt_brs_only.empty:
+        existing_receipt_refs = {
+            str(item.get("ref", "")).strip()
+            for item in dnc_new_remaining
+            if item.get("source") == "receipt"
+        }
+        added_receipt_refs = set()
+        for _, receipt_row in _receipt_brs_only.iterrows():
+            ref = str(receipt_row["bill_no"]).strip()
+            if ref in existing_receipt_refs or ref in added_receipt_refs:
+                continue
+            dnc_new_remaining.append(_receipt_brs_display_item(receipt_row))
+            added_receipt_refs.add(ref)
+        if added_receipt_refs:
+            print(f"  Added {len(added_receipt_refs)} correction receipt row(s) to BRS display only")
     cnb_cf_remaining  = [item for i, item in enumerate(cnb_cf)  if i not in cnb_cf_cleared]
 
     # Correction-amount carry-forwards should first get a chance to clear
@@ -1322,12 +1345,13 @@ def process_qr_files(
         _filtered_cnb_cf_remaining.append(item)
     cnb_cf_remaining = _filtered_cnb_cf_remaining
 
-    # Partial/Low name matches and amount differences appear in DNC+CNB sheets
-    # for engineer review, but are tagged exclude_from_brs=True so they do NOT
-    # affect the BRS running balance (they are already reconciled by amount+branch+date).
+    # Party-confirmation matches and amount differences appear in DNC+CNB sheets
+    # for review, but exact same-amount items are tagged exclude_from_brs=True so
+    # they do NOT affect the BRS running balance. The party-confirmation margin is
+    # fixed below 50% to avoid pushing normal partial matches into reco sheets.
     hard_brs_duplicates = [
         m for m in matched_rows
-        if m["Name Match"] in ("Partial", "Low") or m["Diff"] != 0
+        if m["Score%"] < PARTY_CONFIRMATION_THRESHOLD or m["Diff"] != 0
     ]
     for m in hard_brs_duplicates:
         # Exact-amount partial/low name matches are already reconciled by amount.
@@ -1364,7 +1388,7 @@ def process_qr_files(
         })
 
     if hard_brs_duplicates:
-        print(f"  Also showing {len(hard_brs_duplicates)} partial/low match(es) in DNC/CNB for review")
+        print(f"  Also showing {len(hard_brs_duplicates)} party-confirmation/amount-diff match(es) in DNC/CNB for review")
 
     # ══════════════════════════════════════════════════════════════════════════
     #  STEP 5 — BUILD DNC AND CNB LISTS
@@ -1560,7 +1584,21 @@ def process_qr_files(
         ["Date", "Branch", "Bank", "Bill No.", "Cheque No.", "RRN",
          "Party Name", "Amount (Rs)", "Diff (HOT vs Bank)", "Narration"])
 
-    for _, row in ps.iterrows():
+    _ps_sheet_rows = ps.copy()
+    _ps_sheet_rows["book_source"] = "public_sale"
+    _receipt_sheet_rows = ar[
+        (ar["amount"] > 0) &
+        (ar["bill_no"].astype(str).str.lower() != "rc-nan") &
+        ((~ar["is_correction"]) | (ar.apply(_is_brs_display_receipt, axis=1)))
+    ].copy()
+    _receipt_sheet_rows["book_source"] = "receipt"
+    _cheque_book_rows = pd.concat(
+        [_ps_sheet_rows, _receipt_sheet_rows],
+        ignore_index=True,
+        sort=False,
+    )
+
+    for _, row in _cheque_book_rows.iterrows():
         r += 1
         dt      = row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else ""
         bill    = row["bill_no"]
@@ -1597,8 +1635,12 @@ def process_qr_files(
         elif bill in _wrongly_accounted_bills:
             # Fix A: entry was excluded from BRS matching — label it clearly.
             narration = "WRONGLY ACCOUNTED — EXCLUDED FROM BRS"
-        elif bill in dnc_brs_refs:
+        elif bill in dnc_brs_refs and row.get("book_source") != "receipt":
             narration = "WRONGLY ACCOUNTED"
+        elif bill in dnc_brs_refs and row.get("book_source") == "receipt":
+            narration = "RECEIPT ENTRY - NOT YET IN BANK GATEWAY"
+        elif row.get("book_source") == "receipt":
+            narration = str(row.get("narration", "") or "")
         else:
             narration = ""
 
@@ -2123,11 +2165,11 @@ def process_qr_files(
     _brs_blank()
 
     # ── Matched Transactions with Discrepancies ───────────────────────────────
-    # Surfaces any matched pair where name score < 90% or amounts differ,
-    # so an auditor can verify them before sign-off.
+    # Surfaces any matched pair where name score is below the fixed
+    # party-confirmation margin or amounts differ.
     _disc_rows = [
         m for m in matched_rows
-        if m["Name Match"] in ("Partial", "Low") or m["Diff"] != 0
+        if m["Score%"] < PARTY_CONFIRMATION_THRESHOLD or m["Diff"] != 0
     ]
 
     if _disc_rows:
@@ -2172,10 +2214,10 @@ def process_qr_files(
             _diff = _m["Diff"]
             _sc   = _m["Score%"]
 
-            # Row colour: red=Low, peach=Partial, amber=amt-only diff
-            if _nm == "Low":
+            # Row colour: red=party confirmation, peach=name note, amber=amt-only diff
+            if _sc < PARTY_CONFIRMATION_THRESHOLD:
                 _row_bg = fill("FFC7CE")
-            elif _nm == "Partial":
+            elif _nm in ("Partial", "Low"):
                 _row_bg = fill("FCE4D6")
             else:
                 _row_bg = fill("FFEB9C")
@@ -2236,6 +2278,11 @@ def process_qr_files(
         _leg.fill      = fill("FFF2CC")
         _leg.font      = Font(name="Calibri", size=8, italic=True, color="7F4F00")
         _leg.border    = _bdr
+        _leg.value     = (
+            f"Red = Party Confirmation (<{PARTY_CONFIRMATION_THRESHOLD}%) - manual verification required   "
+            f"Orange = Name Match ({PARTY_CONFIRMATION_THRESHOLD}-89%) - informational only   "
+            "Yellow = Amount difference - review and confirm"
+        )
         _leg.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
         for _col in range(2, 12):
             ws7.cell(r7, _col).fill   = fill("FFF2CC")

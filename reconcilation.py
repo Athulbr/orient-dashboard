@@ -13,6 +13,7 @@ for _stream in (sys.stdout, sys.stderr):
 # -- CONFIG -------------------------------------------------------------------
 OUTPUT_FILE        = "Bank_Reconciliation.xlsx"
 FUZZY_THRESHOLD    = 65
+PARTY_CONFIRMATION_THRESHOLD = 50
 DATE_THRESHOLD_DAYS = 3
 COL_TXN      = 0   # Transaction type
 COL_DATE     = 2   # Date
@@ -2245,6 +2246,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
         already_recorded   = False
         matched_book_only_idx = None
         matched_book_only_indices = []
+        matched_current_book_rows = []
 
         # Cross-clear: if this credited_not_book item was already cancelled by a
         # matching deposited_not_credited item (same party/amount), skip it.
@@ -2336,6 +2338,30 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                     return True
             return False
 
+        def _remember_current_book_row(book_row):
+            data = book_row.to_dict() if hasattr(book_row, "to_dict") else dict(book_row)
+            key = (
+                str(data.get("Date", "")).strip(),
+                str(data.get("Txn Type", "")).strip(),
+                str(data.get("Bill No", "")).strip(),
+                str(data.get("Chq No", "")).strip(),
+                str(data.get("Party", "")).strip().upper(),
+                round(float(data.get("Book Amt (Rs)", 0) or 0), 2),
+            )
+            seen = {
+                (
+                    str(r.get("Date", "")).strip(),
+                    str(r.get("Txn Type", "")).strip(),
+                    str(r.get("Bill No", "")).strip(),
+                    str(r.get("Chq No", "")).strip(),
+                    str(r.get("Party", "")).strip().upper(),
+                    round(float(r.get("Book Amt (Rs)", 0) or 0), 2),
+                )
+                for r in matched_current_book_rows
+            }
+            if key not in seen:
+                matched_current_book_rows.append(data)
+
         for bi, br in book_df.iterrows():
             if br["Direction"] != "INFLOW":
                 continue
@@ -2361,6 +2387,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 already_recorded = True
                 matched_book_only_idx = bo_idx_for_br
                 matched_book_only_indices.append(bo_idx_for_br)
+                _remember_current_book_row(br)
                 book_only_indices_to_remove.append(bo_idx_for_br)
                 print(f"[CF] Check1 cleared (was book_only): "
                       f"CF={item['party']} ₹{item['amount']:,.2f} ↔ book={br['Party']}")
@@ -2372,6 +2399,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                       f"but that book row is already consumed by current-period matching")
                 continue
             matched_book_only_indices.append(matched_book_only_idx)
+            _remember_current_book_row(br)
             already_recorded = True
             print(f"[CF] Check1 cleared: CF={item['party']} ₹{item['amount']:,.2f} "
                   f"↔ book={br['Party']}  book_only_idx={matched_book_only_idx}")
@@ -2404,6 +2432,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                               f"but no outstanding book_only row remains")
                         continue
                     matched_book_only_indices.append(matched_book_only_idx)
+                    _remember_current_book_row(br)
                     already_recorded = True
                     print(f"[CF] Check2 cleared (word overlap): CF={item['party']} "
                         f"₹{item['amount']:,.2f} ↔ book={br['Party']}")
@@ -2445,6 +2474,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                                   f"has no outstanding book_only row")
                             continue
                         matched_book_only_indices.append(matched_book_only_idx)
+                        _remember_current_book_row(br)
                         already_recorded = True
                         excess_amount    = round(cf_amt - book_amt, 2)
                         print(f"[CF] Check3 partial: {item['party']} "
@@ -2539,6 +2569,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                                   f"but no outstanding book_only row remains")
                             continue
                         matched_book_only_indices.append(matched_book_only_idx)
+                        _remember_current_book_row(br)
                         already_recorded = True
                         print(f"[CF] Check4 cleared (absent from stmt_only + book match): "
                               f"CF={item['party']} ₹{item['amount']:,.2f} "
@@ -2546,10 +2577,32 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                         break
 
         if already_recorded:
-            _book_rows_for_audit = []
+            _book_rows_for_audit = list(matched_current_book_rows)
+            _audit_keys = {
+                (
+                    str(r.get("Date", "")).strip(),
+                    str(r.get("Txn Type", "")).strip(),
+                    str(r.get("Bill No", "")).strip(),
+                    str(r.get("Chq No", "")).strip(),
+                    str(r.get("Party", "")).strip().upper(),
+                    round(float(r.get("Book Amt (Rs)", 0) or 0), 2),
+                )
+                for r in _book_rows_for_audit
+            }
             for _mbi in dict.fromkeys(matched_book_only_indices):
                 if _mbi in book_only.index:
-                    _book_rows_for_audit.append(book_only.loc[_mbi].to_dict())
+                    _audit_row = book_only.loc[_mbi].to_dict()
+                    _audit_key = (
+                        str(_audit_row.get("Date", "")).strip(),
+                        str(_audit_row.get("Txn Type", "")).strip(),
+                        str(_audit_row.get("Bill No", "")).strip(),
+                        str(_audit_row.get("Chq No", "")).strip(),
+                        str(_audit_row.get("Party", "")).strip().upper(),
+                        round(float(_audit_row.get("Book Amt (Rs)", 0) or 0), 2),
+                    )
+                    if _audit_key not in _audit_keys:
+                        _book_rows_for_audit.append(_audit_row)
+                        _audit_keys.add(_audit_key)
             cleared_log.append({
                 **item,
                 "section": "credited_not_book",
@@ -4801,7 +4854,7 @@ def reconcile(book_df, stmt_df):
     # unmatched sections while still keeping the discrepancy row.
     if not matched.empty:
         hard_mismatch_mask = (
-            (matched["Name Match"].isin(["Mismatch", "Partial"])) |
+            (matched["Fuzzy Score %"] < PARTY_CONFIRMATION_THRESHOLD) |
             (
                 matched["Amount Match"].astype(str).str.startswith("Diff") &
                 (~matched.get("Partial Payment", pd.Series(False, index=matched.index)).astype(bool))
@@ -4897,9 +4950,20 @@ def _make_row(br, sr, method, score, partial_note=""):
     if d_diff is not None and d_diff > 0:
         date_note = f"Date gap: {d_diff}d"
 
+    def _real_chq(value):
+        text = str(value or "").strip()
+        return text if text.lower() not in ("", "nan", "0", "99", "511", "-") else ""
+
+    book_chq = _real_chq(br.get("Chq No", ""))
+    bank_chq = _real_chq(sr.get("Chq No", ""))
+    chq_note = ""
+    if book_chq and bank_chq and book_chq != bank_chq:
+        chq_note = f"Cheque no differs: Book={book_chq} Bank={bank_chq}"
+
     flags = [x for x in [
         f"Name {score}% -- verify"            if name_flag != "Match"                  else "",
         ""                                    if amt_flag  == "Exact"                  else amt_flag,
+        chq_note,
         dir_flag,
         date_note,
         "Third party payment -- verify name"  if "3rd Party" in method                 else "",
@@ -5695,7 +5759,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
     # These are technically reconciled but need human verification.
     if matched_df is not None and not matched_df.empty:
         discrepancy_mask = (
-            (matched_df["Name Match"].isin(["Mismatch", "Partial"])) |
+            (matched_df["Fuzzy Score %"] < PARTY_CONFIRMATION_THRESHOLD) |
             (matched_df["Amount Match"].str.startswith("Diff")) |
             (matched_df.get("Partial Payment", pd.Series(False, index=matched_df.index)).astype(bool))
         )
@@ -5703,11 +5767,11 @@ def build_brs_sheet(wb, book_only, stmt_only,
         if not discrepancies.empty:
             # Count by type for the section header
             n_partial  = int(discrepancies.get("Partial Payment", pd.Series(False, index=discrepancies.index)).sum())
-            n_mismatch = int((discrepancies["Name Match"] == "Mismatch").sum())
+            n_mismatch = int((discrepancies["Fuzzy Score %"] < PARTY_CONFIRMATION_THRESHOLD).sum())
             n_amt_diff = int(discrepancies["Amount Match"].str.startswith("Diff").sum())
             type_parts = []
             if n_partial:  type_parts.append(f"{n_partial} partial payment{'s' if n_partial>1 else ''}")
-            if n_mismatch: type_parts.append(f"{n_mismatch} name mismatch{'es' if n_mismatch>1 else ''}")
+            if n_mismatch: type_parts.append(f"{n_mismatch} party confirmation{'s' if n_mismatch>1 else ''}")
             if n_amt_diff: type_parts.append(f"{n_amt_diff} amount difference{'s' if n_amt_diff>1 else ''}")
             type_summary = ", ".join(type_parts)
 
@@ -5719,7 +5783,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             mismatch_col_header_row()
             for _, mr in discrepancies.iterrows():
                 is_partial = bool(mr.get("Partial Payment", False))
-                is_nm      = mr["Name Match"] == "Mismatch"
+                is_nm      = mr["Fuzzy Score %"] < PARTY_CONFIRMATION_THRESHOLD
                 # Build a concise flag string for this row
                 flag_parts = []
                 if is_partial and mr.get("Flags", ""):
@@ -5728,13 +5792,13 @@ def build_brs_sheet(wb, book_only, stmt_only,
                         if seg.startswith("PARTIAL PAYMENT") or seg.startswith("SPLIT PAYMENT"):
                             flag_parts.append(seg)
                             break
-                if mr["Name Match"] == "Mismatch":
+                if mr["Fuzzy Score %"] < PARTY_CONFIRMATION_THRESHOLD:
                     flag_parts.append(
-                        f"NAME MISMATCH (score {mr['Fuzzy Score %']}%): "
+                        f"PARTY CONFIRMATION (score {mr['Fuzzy Score %']}%): "
                         f"Book='{mr['Book Party']}' vs Bank='{mr['Bank Party']}' — "
                         f"Verify party identity before clearance"
                     )
-                elif mr["Name Match"] == "Partial":
+                elif False and mr["Name Match"] == "Partial":
                     flag_parts.append(
                         f"PARTIAL NAME MATCH (score {mr['Fuzzy Score %']}%): "
                         f"Book='{mr['Book Party']}' vs Bank='{mr['Bank Party']}' — "
@@ -5753,7 +5817,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
                                                     "AMOUNT DIFFERENCE", "Name ")):
                         flag_parts.append(seg)
                 flag_text = " | ".join(dict.fromkeys(filter(None, flag_parts)))  # deduplicate
-                # Row colour: orange-red for name mismatch, peach for partial, yellow for others
+                # Row colour: red for party confirmation, peach for partial payments, yellow for others
                 is_name_mismatch_row = is_nm
                 mismatch_item_row(
                     book_date        = mr.get("Book Date", ""),
@@ -5777,6 +5841,11 @@ def build_brs_sheet(wb, book_only, stmt_only,
                         " Yellow = Amount diff or partial name — review and confirm",
                         legend_fill,
                         Font(name=FONT_NAME, size=8, italic=True, color="7F4F00"))
+            ws.cell(r, 1).value = (
+                f" Red = Party Confirmation (<{PARTY_CONFIRMATION_THRESHOLD}%) - verify party before sign-off   "
+                " Orange = Partial/Split Payment - confirm all parts recorded   "
+                " Yellow = Amount diff - review and confirm"
+            )
             ws.row_dimensions[r].height = 16
             r += 1
             blank_row()
