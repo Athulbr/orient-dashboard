@@ -1,0 +1,17 @@
+name: Deploy bank_reconciliation OnPrem
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: rehab-mart/cicd-actions/.github/workflows/reusable-onprem-deploy.yml@main
+
+    with:
+      app_name: "bank_reconciliation"
+      app_port: "8000"
+      branch: "main"
