@@ -15,3 +15,6 @@ jobs:
       app_name: "bank_reconciliation"
       app_port: "8000"
       branch: "main"
+
+    secrets:
+      NPM_READ_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
