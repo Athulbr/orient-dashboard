@@ -8,10 +8,12 @@ import numpy as np
 from reconcilation import (
     process_files, get_sheet_metadata,
     parse_book, parse_statement, extract_brs_date, parse_date,
-    detect_book_sheet, safe_read_excel, find_book_bank_id, extract_account_from_book
+    detect_book_sheet, safe_read_excel, find_book_bank_id, extract_account_from_book, count_book_transactions_by_bill_no
 )
-from qr_reconcilation import process_qr_files
+from qr_reconcilation import process_qr_files, count_transactions_by_bill_no_and_name
 from gateway_reconcilation import process_gateway_files
+import requests
+from config import RECONCILIATION_API
 
 app = FastAPI(title="Bank Reconciliation API")
 
@@ -23,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".pdf"}
 
 def _sanitize(obj):
     """Recursively sanitize for JSON — handles numpy/pandas scalar types."""
@@ -52,6 +54,18 @@ def _sanitize(obj):
     if isinstance(obj, int):
         return int(obj)
     return obj
+
+def _format_transaction_date(value):
+    if value is None:
+        return ""
+    try:
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+    except Exception:
+        pass
+    if hasattr(value, "strftime"):
+        return value.strftime("%d-%m-%Y")
+    return str(value)
 
 def _validate_filename(filename: str) -> None:
     ext = os.path.splitext(filename)[1].lower()
@@ -144,6 +158,21 @@ def _compute_qr_brs(book_closing_bal, bank_closing_bal, book_only_df, bank_only_
     }
 
 
+def post_reconciliation(transaction_info):
+    try:
+        response = requests.post(
+            RECONCILIATION_API,
+            json=transaction_info,
+            timeout=30
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"Failed to update reconciliation database: {str(e)}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NORMAL BANK RECONCILIATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -202,6 +231,26 @@ async def reconcile_endpoint(
         original_book_count = len(raw_book_df)
         original_stmt_count = len(raw_stmt_df)
 
+        book_transaction_count = count_book_transactions_by_bill_no(raw_book_df)
+        book_transactions = []
+        for row, txn_no in zip(raw_book_df.to_dict("records"), book_transaction_count["transaction_numbers"]):
+            book_transactions.append({
+                "Date": row.get("Date", ""),
+                "Bill No": row.get("Bill No", row.get("Book Bill No", "")),
+                "Name": row.get("Party", row.get("Book Party", row.get("Name", ""))),
+                "TXN No": f"TXN-{int(txn_no):02d}",
+            })
+
+        transaction_info = {
+            "file_name": book_file.filename,
+            "row_count": len(book_transactions),
+            "transaction_count": book_transaction_count["transaction_count"],
+            "transaction_type": "bank",
+            "transactions": _sanitize(book_transactions),
+        }
+
+        post_reconciliation(transaction_info)
+
         brs_date = extract_brs_date(prev_brs_path)
 
         title_date = brs_date
@@ -223,7 +272,7 @@ async def reconcile_endpoint(
 
         output_path = os.path.join(tmpdir, "Reconciliation.xlsx")
 
-        matched, book_only, stmt_only = process_files(
+        matched, book_only, stmt_only, book_closing_bal, bank_closing_bal = process_files(
             book_path, stmt_path, output_path, prev_brs_path
         )
 
@@ -270,6 +319,7 @@ async def reconcile_endpoint(
         "company_name": company_name,
         "account_info": account_info,
         "brs_date":     title_date,
+        "transaction_info": transaction_info,
 
         "summary": {
             "book_entries":      original_book_count,
@@ -322,6 +372,33 @@ async def reconcile_qr_endpoint(
         all_branches_sheets = get_sheet_metadata(all_branches_path)
         hot_book_sheets     = get_sheet_metadata(hot_book_path)
         stmt_sheets         = get_sheet_metadata(stmt_path)
+
+        qr_transaction_rows = count_transactions_by_bill_no_and_name(all_branches_path)
+        qr_transactions = []
+        qr_seen_transactions = {}
+        for row in qr_transaction_rows.to_dict("records"):
+            key = (
+                str(row.get("party", "")).strip().upper(),
+                str(row.get("bill_no", "")).strip().upper(),
+            )
+            if key not in qr_seen_transactions:
+                qr_seen_transactions[key] = len(qr_seen_transactions) + 1
+            qr_transactions.append({
+                "Date": _format_transaction_date(row.get("date", "")),
+                "Bill No": row.get("bill_no", ""),
+                "Name": row.get("party", ""),
+                "TXN No": f"TXN-{qr_seen_transactions[key]:02d}",
+            })
+
+        transaction_info = {
+            "file_name": all_branches_file.filename,
+            "row_count": len(qr_transactions),
+            "transaction_count": len(qr_seen_transactions),
+            "transaction_type": "QR",
+            "transactions": _sanitize(qr_transactions),
+        }
+
+        post_reconciliation(transaction_info)
  
         output_path = os.path.join(tmpdir, "QR_Reconciliation.xlsx")
  
@@ -499,6 +576,7 @@ async def reconcile_qr_endpoint(
         "company_name": "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
         "account_info": "QR-HDFC Account",
         "brs_date":     brs_date,
+        "transaction_info": transaction_info,
  
         "books_match":        books_match,
         "reconciled":         reconciled,
@@ -537,22 +615,23 @@ async def reconcile_gateway_endpoint(
     all_branches_file: UploadFile = File(..., description="All-branches Gateway book report (.xls)"),
     hot_book_file:     UploadFile = File(..., description="HOT Gateway book report (.xls)"),
     statement_file:    UploadFile = File(..., description="YES Bank statement PDF"),
-    payu_file:         UploadFile = File(..., description="PayU regular transaction report (.xlsx)"),
-    payu_od_files:     list[UploadFile] = File(default=[], description="PayU On-Demand report(s) (.xlsx) — repeat for multiple"),
-    cashfree_file:     UploadFile = File(..., description="CashFree settlement report (.xlsx)"),
-    easebuzz_file:     UploadFile = File(..., description="EaseBuzz settlement report (.csv)"),
+    payu_files:        list[UploadFile] = File(default=[], description="PayU regular (.xlsx) — 0 to 4 files"),
+    payu_od_files:     list[UploadFile] = File(default=[], description="PayU On-Demand (.xlsx) — 0 to 4 files"),
+    cashfree_files:    list[UploadFile] = File(default=[], description="CashFree (.xlsx) — 0 to 4 files"),
+    easebuzz_files:    list[UploadFile] = File(default=[], description="EaseBuzz (.csv) — 0 to 4 files"),
     previous_brs_file: UploadFile = File(..., description="Previous day BRS workbook (.xlsx)"),
 ):
     # Validate file extensions
-    for f in [all_branches_file, hot_book_file, payu_file, previous_brs_file]:
+    for f in [all_branches_file, hot_book_file]:
         _validate_filename(f.filename)
-    for f in payu_od_files:
+    for f in payu_files + payu_od_files + cashfree_files:
         _validate_filename(f.filename)
-    _validate_filename(cashfree_file.filename)
-    ext = os.path.splitext(easebuzz_file.filename)[1].lower()
-    if ext not in {".csv", ".xlsx", ".xls"}:
-        raise HTTPException(status_code=400,
-            detail=f"EaseBuzz file '{easebuzz_file.filename}' must be .csv or .xlsx")
+    for f in easebuzz_files:
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in {".csv", ".xlsx", ".xls"}:
+            raise HTTPException(status_code=400,
+                detail=f"EaseBuzz file '{f.filename}' must be .csv or .xlsx")
+    _validate_filename(previous_brs_file.filename)
 
     tmpdir    = tempfile.mkdtemp()
     file_data = None
@@ -561,24 +640,34 @@ async def reconcile_gateway_endpoint(
         all_branches_path = os.path.join(tmpdir, all_branches_file.filename)
         hot_book_path     = os.path.join(tmpdir, hot_book_file.filename)
         stmt_path         = os.path.join(tmpdir, statement_file.filename)
-        payu_path         = os.path.join(tmpdir, payu_file.filename)
 
         with open(all_branches_path, "wb") as f: f.write(await all_branches_file.read())
         with open(hot_book_path,     "wb") as f: f.write(await hot_book_file.read())
         with open(stmt_path,         "wb") as f: f.write(await statement_file.read())
-        with open(payu_path,         "wb") as f: f.write(await payu_file.read())
+
+        payu_paths = []
+        for pf in payu_files:
+            p = os.path.join(tmpdir, pf.filename)
+            with open(p, "wb") as f: f.write(await pf.read())
+            payu_paths.append(p)
 
         payu_od_paths = []
         for od in payu_od_files:
-            od_path = os.path.join(tmpdir, od.filename)
-            with open(od_path, "wb") as f: f.write(await od.read())
-            payu_od_paths.append(od_path)
+            p = os.path.join(tmpdir, od.filename)
+            with open(p, "wb") as f: f.write(await od.read())
+            payu_od_paths.append(p)
 
-        cashfree_path = os.path.join(tmpdir, cashfree_file.filename)
-        with open(cashfree_path, "wb") as f: f.write(await cashfree_file.read())
+        cashfree_paths = []
+        for cf in cashfree_files:
+            p = os.path.join(tmpdir, cf.filename)
+            with open(p, "wb") as f: f.write(await cf.read())
+            cashfree_paths.append(p)
 
-        easebuzz_path = os.path.join(tmpdir, easebuzz_file.filename)
-        with open(easebuzz_path, "wb") as f: f.write(await easebuzz_file.read())
+        easebuzz_paths = []
+        for eb in easebuzz_files:
+            p = os.path.join(tmpdir, eb.filename)
+            with open(p, "wb") as f: f.write(await eb.read())
+            easebuzz_paths.append(p)
 
         prev_brs_path = os.path.join(tmpdir, previous_brs_file.filename)
         with open(prev_brs_path, "wb") as f: f.write(await previous_brs_file.read())
@@ -588,7 +677,6 @@ async def reconcile_gateway_endpoint(
         hot_book_sheets     = get_sheet_metadata(hot_book_path)
 
         output_path = os.path.join(tmpdir, "Gateway_Reconcilation.xlsx")
-
         # Run full Gateway reconciliation
         (gateway_results,
          dnc_all,
@@ -624,11 +712,11 @@ async def reconcile_gateway_endpoint(
             all_branches_path = all_branches_path,
             hot_book_path     = hot_book_path,
             statement_path    = stmt_path,
-            payu_paths         = [payu_path],
+            payu_paths        = payu_paths,
             output_path       = output_path,
             payu_od_paths     = payu_od_paths,
-            cashfree_path     = cashfree_path,
-            easebuzz_paths     = [easebuzz_path],
+            cashfree_path     = cashfree_paths,
+            easebuzz_paths    = easebuzz_paths,
             prev_brs_path     = prev_brs_path,
         )
 
@@ -652,8 +740,8 @@ async def reconcile_gateway_endpoint(
         "less_deposited":     round(total_dnc,     2),
         "less_debited_nb":    round(total_less2,   2),
         "add_credited_nb":    round(total_cnb,     2),
-        "reconciled_balance": round(bank_bal,      2),
-        "brs_difference":     0.0 if reconciled else round(bank_bal, 2),
+        "reconciled_balance": round(closing_bal + total_add1 - total_dnc - total_less2 + total_cnb, 2),
+        "brs_difference":     round(bank_bal - (closing_bal + total_add1 - total_dnc - total_less2 + total_cnb), 2),
     }
 
     # ── Summary counts ────────────────────────────────────────────────────────
@@ -803,7 +891,7 @@ async def reconcile_gateway_endpoint(
         "all_branches_file":   all_branches_file.filename,
         "hot_book_file":       hot_book_file.filename,
         "statement_file_name": statement_file.filename,
-        "payu_file":           payu_file.filename,
+        "payu_files": [f.filename for f in payu_files],
         "previous_brs_file":   previous_brs_file.filename,
 
         "all_branches_sheets": all_branches_sheets,
@@ -830,7 +918,7 @@ async def reconcile_gateway_endpoint(
             "matched_with_diff": sum(1 for r in matched_records if r["Amount Match"] != "Exact"),
             "book_only":         total_book_only,
             "bank_only":         total_bank_only,
-            "difference":        0.0 if reconciled else round(bank_bal, 2),
+            "difference":        round(bank_bal - (closing_bal + total_add1 - total_dnc - total_less2 + total_cnb), 2),
         },
 
         "file_bytes": file_data.hex(),
