@@ -394,7 +394,7 @@ async def reconcile_qr_endpoint(
             "file_name": all_branches_file.filename,
             "row_count": len(qr_transactions),
             "transaction_count": len(qr_seen_transactions),
-            "transaction_type": "QR",
+            "transaction_type": "qr",
             "transactions": _sanitize(qr_transactions),
         }
 
