@@ -3186,6 +3186,7 @@ def process_qr_files(
     cnb_new_cleared_by_prev_dnc = set()
     prev_dnc_current_cnb_cleared = set()
     prev_dnc_current_cnb_matches = []
+    prev_dnc_current_cnb_review_matches = []
 
     def _can_clear_prev_dnc_with_current_cnb(name_score, amount_diff):
         # Exact/paise-level differences can clear with a branch/name floor.
@@ -3244,6 +3245,36 @@ def process_qr_files(
                 f"{', diff ' + format(diff, '+,.2f') if abs(diff) > 0.005 else ''})"
             )
             continue
+
+        # Review-only: same branch and exact amount, but name is too weak to
+        # auto-clear. Keep both BRS open items, but surface the possible pair
+        # in Matched and Human Verification for manual confirmation.
+        exact_review_candidates = [
+            ci
+            for ci in candidates
+            if ci not in cnb_new_cleared_by_prev_dnc
+            and abs(cnb_new[ci]["amount"] - d_amt) <= 0.005
+        ]
+        if exact_review_candidates:
+            review_ci = max(
+                exact_review_candidates,
+                key=lambda ci: cf_name_sim(dnc_item["party"], cnb_new[ci]["party"]),
+            )
+            review_score = cf_name_sim(dnc_item["party"], cnb_new[review_ci]["party"])
+            prev_dnc_current_cnb_review_matches.append(
+                {
+                    "dnc": dnc_item,
+                    "cnb": cnb_new[review_ci],
+                    "score": review_score,
+                    "amt_diff": d_amt - cnb_new[review_ci]["amount"],
+                    "review_only": True,
+                }
+            )
+            print(
+                f"  [CF-REVIEW] Previous DNC has same branch/amount current bank credit: "
+                f"{br}/{dnc_item['ref']}/{d_amt:,.0f} "
+                f"<-> {cnb_new[review_ci].get('rrn', '')} (name {review_score}%)"
+            )
 
         if len(candidates) < 2:
             continue
@@ -4429,7 +4460,10 @@ def process_qr_files(
                     num_fmt="#,##0" if c in [11, 16, 19] else None,
                 )
 
-    if prev_dnc_current_cnb_matches:
+    prev_dnc_current_cnb_display_matches = (
+        prev_dnc_current_cnb_matches + prev_dnc_current_cnb_review_matches
+    )
+    if prev_dnc_current_cnb_display_matches:
         r += 1
         _sec_fill_hex = "E2EFDA"
         _sec_fill = fill(_sec_fill_hex)
@@ -4450,7 +4484,7 @@ def process_qr_files(
             ws3.cell(r, _col).border = _BR
         ws3.row_dimensions[r].height = 20
 
-        for pair in prev_dnc_current_cnb_matches:
+        for pair in prev_dnc_current_cnb_display_matches:
             dnc = pair["dnc"]
             cnb = pair["cnb"]
             sc = pair["score"]
@@ -4460,7 +4494,12 @@ def process_qr_files(
                 if sc >= FUZZY_THRESH
                 else "Partial" if sc >= FUZZY_ACCEPT else "Low"
             )
-            flag = f"Previous DNC cleared by current bank credit (name {sc}%)"
+            is_review_only = bool(pair.get("review_only"))
+            flag = (
+                f"Manual review only - same branch/amount, name mismatch (name {sc}%)"
+                if is_review_only
+                else f"Previous DNC cleared by current bank credit (name {sc}%)"
+            )
             bg = (
                 C_AMBER
                 if nm in ("Partial", "Low") or abs(adiff) > 0.005
@@ -4483,7 +4522,7 @@ def process_qr_files(
                 cnb_row = {**cnb, **cnb_parts[0]}
                 r += 1
                 vals = [
-                    "CF-DNC-Clear",
+                    "CF-DNC-Review" if is_review_only else "CF-DNC-Clear",
                     nm,
                     sc,
                     f"CF-Clear split x{len(cnb_parts)}",
@@ -4521,10 +4560,10 @@ def process_qr_files(
             else:
                 r += 1
                 vals = [
-                    "CF-DNC-Clear",
+                    "CF-DNC-Review" if is_review_only else "CF-DNC-Clear",
                     nm,
                     sc,
-                    "CF-Clear",
+                    "Manual Review" if is_review_only else "CF-Clear",
                     dnc["date"],
                     dnc["branch"],
                     QR_ACCOUNT_CODE,
@@ -5631,7 +5670,7 @@ def process_qr_files(
         )
         _sec_a_rows.append((m, issue_type, issue_desc))
 
-    for pair in prev_dnc_current_cnb_matches:
+    for pair in prev_dnc_current_cnb_display_matches:
         dnc_p = pair["dnc"]
         cnb_p = pair["cnb"]
         sc = pair.get("score", 0) or 0
@@ -5682,7 +5721,7 @@ def process_qr_files(
         _sec_a_rows.append(
             (
                 {
-                    "Method": "CF-DNC-Clear",
+                    "Method": "CF-DNC-Review" if pair.get("review_only") else "CF-DNC-Clear",
                     "Book Date": dnc_p.get("date", ""),
                     "Bank Date": bank_date,
                     "Book Bill No": dnc_p.get("ref", ""),
