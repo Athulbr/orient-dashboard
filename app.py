@@ -1,7 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os, tempfile, gc, shutil
+import zipfile
+import threading
+from datetime import datetime
 import math
 import numpy as np
 
@@ -13,7 +16,7 @@ from reconcilation import (
 from qr_reconcilation import process_qr_files, count_transactions_by_bill_no_and_name
 from gateway_reconcilation import process_gateway_files
 import requests
-from config import RECONCILIATION_API
+from config import RECONCILIATION_API, TRANSACTIONS_DIR
 
 app = FastAPI(title="Bank Reconciliation API")
 
@@ -26,6 +29,37 @@ app.add_middleware(
 )
 
 ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".pdf"}
+
+
+_archive_lock = threading.Lock()
+
+def _ext(filename: str) -> str:
+    return os.path.splitext(filename)[1].lower()
+
+def _next_transaction_dir(recon_type: str) -> str:
+    date_folder = datetime.now().strftime("%d-%m-%Y")
+    base = os.path.join(TRANSACTIONS_DIR, date_folder, recon_type)
+    with _archive_lock:
+        os.makedirs(base, exist_ok=True)
+        existing = [
+            int(d.replace("transaction", ""))
+            for d in os.listdir(base)
+            if d.startswith("transaction") and d.replace("transaction", "").isdigit()
+        ]
+        txn_dir = os.path.join(base, f"transaction{max(existing, default=0) + 1}")
+        os.makedirs(txn_dir)
+    return txn_dir
+
+def _archive_transaction(recon_type, input_files, output_path, output_name):
+    try:
+        txn_dir = _next_transaction_dir(recon_type)
+        for src_path, save_name in input_files:
+            if src_path and os.path.exists(src_path):
+                shutil.copy2(src_path, os.path.join(txn_dir, save_name))
+        if output_path and os.path.exists(output_path):
+            shutil.copy2(output_path, os.path.join(txn_dir, output_name))
+    except Exception as e:
+        print(f"[archive] Failed to archive {recon_type} transaction: {e}")
 
 def _sanitize(obj):
     """Recursively sanitize for JSON — handles numpy/pandas scalar types."""
@@ -278,6 +312,12 @@ async def reconcile_endpoint(
 
         with open(output_path, "rb") as f:
             file_data = f.read()
+        
+        _archive_transaction("bank", [
+            (book_path,     f"book_report{_ext(book_file.filename)}"),
+            (stmt_path,     f"bank_statement{_ext(statement_file.filename)}"),
+            (prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"),
+        ], output_path, "Reconciliation.xlsx")
 
     finally:
         gc.collect()
@@ -415,6 +455,13 @@ async def reconcile_qr_endpoint(
  
         with open(output_path, "rb") as f:
             file_data = f.read()
+        
+        _archive_transaction("qr", [
+            (all_branches_path, f"all_branches{_ext(all_branches_file.filename)}"),
+            (hot_book_path,     f"hot_book{_ext(hot_book_file.filename)}"),
+            (stmt_path,         f"qr_statement{_ext(statement_file.filename)}"),
+            (prev_brs_path,     f"previous_brs{_ext(previous_brs_file.filename)}"),
+        ], output_path, "QR_Reconciliation.xlsx")
  
     finally:
         gc.collect()
@@ -722,6 +769,21 @@ async def reconcile_gateway_endpoint(
 
         with open(output_path, "rb") as f:
             file_data = f.read()
+        
+        _gw_inputs = [
+            (all_branches_path, f"all_branches{_ext(all_branches_file.filename)}"),
+            (hot_book_path,     f"hot_book{_ext(hot_book_file.filename)}"),
+            (stmt_path,         f"yes_bank_statement{_ext(statement_file.filename)}"),
+        ]
+        _gw_inputs += [(p, f"payu{i+1}{_ext(p)}")     for i, p in enumerate(payu_paths)]
+        _gw_inputs += [(p, f"payu_od{i+1}{_ext(p)}")  for i, p in enumerate(payu_od_paths)]
+        _gw_inputs += [(p, f"cashfree{i+1}{_ext(p)}") for i, p in enumerate(cashfree_paths)]
+        _gw_inputs += [(p, f"easebuzz{i+1}{_ext(p)}") for i, p in enumerate(easebuzz_paths)]
+        _gw_inputs.append((prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"))
+
+        _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_Reconciliation.xlsx")
+        
+
 
     finally:
         gc.collect()
@@ -932,3 +994,27 @@ def root():
         "status":  "ok",
         "message": "POST /reconcile (bank) | /reconcile-qr (QR) | /reconcile-gateway (Gateway YES Bank)",
     }
+
+
+@app.get("/file-download", summary="Download all archived transactions as a zip.")
+def file_download(background_tasks: BackgroundTasks):
+    if not os.path.isdir(TRANSACTIONS_DIR) or not os.listdir(TRANSACTIONS_DIR):
+        raise HTTPException(status_code=404, detail="No transactions archived yet.")
+
+    tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_zip.close()
+
+    with zipfile.ZipFile(tmp_zip.name, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root_dir, _, files in os.walk(TRANSACTIONS_DIR):
+            for fname in files:
+                fpath   = os.path.join(root_dir, fname)
+                arcname = os.path.join("Transactions", os.path.relpath(fpath, TRANSACTIONS_DIR))
+                zf.write(fpath, arcname)
+
+    background_tasks.add_task(os.remove, tmp_zip.name)
+
+    return FileResponse(
+        tmp_zip.name,
+        media_type="application/zip",
+        filename="Transactions.zip",
+    )

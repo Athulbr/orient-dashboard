@@ -3138,6 +3138,7 @@ def process_qr_files(
     # Guard: skip for known multi-day combined statements where pairs should stay open.
     prev_dnc_cleared = set()
     prev_cnb_cleared = set()
+    prev_dnc_cnb_pair_matches = []
     _cf_pair_cleared_total = (
         0.0  # sum of DNC amounts cleared via prev-DNC/CNB pair match
     )
@@ -3149,6 +3150,15 @@ def process_qr_files(
         return str(b).strip().replace("PS -", "PS-").replace("ps -", "PS-").upper()
 
     _hot_pay_bills = set(_norm_bill(b) for b in hot_pay["bill_no"])
+
+    def _prev_dnc_cnb_pair_name_threshold(amount):
+        # Tiny exact-amount carry-forwards (Rs 1 etc.) collide frequently by
+        # branch+amount. Require a strong name match so an unrelated micro CNB
+        # does not clear the real DNC before the actual bank credit is checked.
+        if abs(float(amount or 0)) <= 1.005:
+            return FUZZY_THRESH
+        return PARTY_CONFIRMATION_THRESHOLD
+
     if BRS_DATE != "02.05.2026":
         for di, dnc_item in enumerate(dnc_cf):
             for ci, cnb_item in enumerate(cnb_cf_remaining):
@@ -3156,23 +3166,42 @@ def process_qr_files(
                     continue
                 if dnc_item["branch"] != cnb_item["branch"]:
                     continue
-                if abs(dnc_item["amount"] - cnb_item["amount"]) > 0.005:
+                pair_diff = dnc_item["amount"] - cnb_item["amount"]
+                abs_pair_diff = abs(pair_diff)
+                if abs_pair_diff > _4B_AMT_DIFF_MAX:
                     continue
                 sc = cf_name_sim(dnc_item["party"], cnb_item["party"])
-                if sc < 50:
+                min_pair_score = (
+                    _prev_dnc_cnb_pair_name_threshold(dnc_item["amount"])
+                    if abs_pair_diff <= 0.005
+                    else FUZZY_ACCEPT
+                )
+                if sc < min_pair_score:
                     continue
                 prev_dnc_cleared.add(di)
                 prev_cnb_cleared.add(ci)
+                prev_dnc_cnb_pair_matches.append(
+                    {
+                        "dnc": dnc_item,
+                        "cnb": cnb_item,
+                        "score": sc,
+                        "amt_diff": pair_diff,
+                        "pair_cleared": True,
+                    }
+                )
                 # Only deduct from hot_settlement_payments if HOT actually posted
                 # a payment for this bill today -- micro-payments (Rs 1 etc.) and
                 # items HOT didn't re-confirm today have no matching hot_pay entry
                 # and must not be deducted.
                 if _norm_bill(dnc_item.get("ref", "")) in _hot_pay_bills:
                     _cf_pair_cleared_total += float(dnc_item["amount"])
+                diff_note = (
+                    f", diff {pair_diff:+,.2f}" if abs_pair_diff > 0.005 else ""
+                )
                 print(
                     f"  [CF-CLEAR] Previous DNC/CNB pair cleared: "
                     f"{dnc_item['branch']}/{dnc_item['ref']}/{dnc_item['amount']:,.0f} "
-                    f"<-> {cnb_item.get('rrn', '')} (name {sc}%)"
+                    f"<-> {cnb_item.get('rrn', '')} (name {sc}%{diff_note})"
                 )
                 break
     if prev_dnc_cleared or prev_cnb_cleared:
@@ -4461,7 +4490,9 @@ def process_qr_files(
                 )
 
     prev_dnc_current_cnb_display_matches = (
-        prev_dnc_current_cnb_matches + prev_dnc_current_cnb_review_matches
+        prev_dnc_cnb_pair_matches
+        + prev_dnc_current_cnb_matches
+        + prev_dnc_current_cnb_review_matches
     )
     if prev_dnc_current_cnb_display_matches:
         r += 1
@@ -4472,8 +4503,8 @@ def process_qr_files(
         sec_hdr = ws3.cell(
             r,
             1,
-            "Previous BRS DNC cleared by current bank credits "
-            "(settled/backdated QR receipts)",
+            "Previous BRS DNC cleared by bank credits "
+            "(previous/current carry-forward audit)",
         )
         sec_hdr.fill = _sec_fill
         sec_hdr.font = Font(bold=True, color="1F3864", name="Calibri", size=10)
@@ -4495,10 +4526,15 @@ def process_qr_files(
                 else "Partial" if sc >= FUZZY_ACCEPT else "Low"
             )
             is_review_only = bool(pair.get("review_only"))
+            is_pair_cleared = bool(pair.get("pair_cleared"))
             flag = (
                 f"Manual review only - same branch/amount, name mismatch (name {sc}%)"
                 if is_review_only
-                else f"Previous DNC cleared by current bank credit (name {sc}%)"
+                else (
+                    f"Previous BRS DNC/CNB pair cleared (name {sc}%)"
+                    if is_pair_cleared
+                    else f"Previous DNC cleared by current bank credit (name {sc}%)"
+                )
             )
             bg = (
                 C_AMBER
@@ -4522,7 +4558,11 @@ def process_qr_files(
                 cnb_row = {**cnb, **cnb_parts[0]}
                 r += 1
                 vals = [
-                    "CF-DNC-Review" if is_review_only else "CF-DNC-Clear",
+                    (
+                        "CF-DNC-Review"
+                        if is_review_only
+                        else "CF-Pair-Clear" if is_pair_cleared else "CF-DNC-Clear"
+                    ),
                     nm,
                     sc,
                     f"CF-Clear split x{len(cnb_parts)}",
@@ -4560,10 +4600,18 @@ def process_qr_files(
             else:
                 r += 1
                 vals = [
-                    "CF-DNC-Review" if is_review_only else "CF-DNC-Clear",
+                    (
+                        "CF-DNC-Review"
+                        if is_review_only
+                        else "CF-Pair-Clear" if is_pair_cleared else "CF-DNC-Clear"
+                    ),
                     nm,
                     sc,
-                    "Manual Review" if is_review_only else "CF-Clear",
+                    (
+                        "Manual Review"
+                        if is_review_only
+                        else "Prev DNC/CNB Clear" if is_pair_cleared else "CF-Clear"
+                    ),
                     dnc["date"],
                     dnc["branch"],
                     QR_ACCOUNT_CODE,
@@ -5376,8 +5424,59 @@ def process_qr_files(
         for m in matched_rows
         if m["Score%"] < PARTY_CONFIRMATION_THRESHOLD or m["Diff"] != 0
     ]
+    for _pair in prev_dnc_current_cnb_display_matches:
+        _dnc = _pair["dnc"]
+        _cnb = _pair["cnb"]
+        _sc = _pair.get("score", 0) or 0
+        _diff = _pair.get("amt_diff", 0) or 0
+        if _sc >= PARTY_CONFIRMATION_THRESHOLD and abs(_diff) < 1:
+            continue
+        _cnb_parts = _cnb.get("parts", []) or []
+        if _cnb_parts:
+            _bank_date = " / ".join(
+                dict.fromkeys(
+                    str(p.get("settlement_date", "") or p.get("date", ""))
+                    for p in _cnb_parts
+                    if p.get("settlement_date", "") or p.get("date", "")
+                )
+            )
+            _bank_party = " / ".join(
+                str(p.get("party", "")).strip()
+                for p in _cnb_parts
+                if str(p.get("party", "")).strip()
+            )
+            _bank_amt = sum(float(p.get("amount", 0) or 0) for p in _cnb_parts)
+        else:
+            _bank_date = _cnb.get("settlement_date", "") or _cnb.get("date", "")
+            _bank_party = _cnb.get("party", "")
+            _bank_amt = _cnb.get("amount", 0)
+        _disc_rows.append(
+            {
+                "Method": "CF-Pair-Clear" if _pair.get("pair_cleared") else "CF-DNC-Clear",
+                "Name Match": (
+                    "Match"
+                    if _sc >= FUZZY_THRESH
+                    else "Partial" if _sc >= FUZZY_ACCEPT else "Low"
+                ),
+                "Score%": _sc,
+                "Book Date": _dnc.get("date", ""),
+                "Book Branch": _dnc.get("branch", ""),
+                "Book Bill No": _dnc.get("ref", ""),
+                "Book Party": _dnc.get("party", ""),
+                "Book Amt": _dnc.get("amount", 0),
+                "Bank Date": _bank_date,
+                "Bank Payer": _bank_party,
+                "Bank Amt": _bank_amt,
+                "Diff": _diff,
+                "Flags": (
+                    f"AMOUNT DIFFERENCE Rs {_diff:+,.2f} - previous BRS DNC/CNB clear"
+                    if abs(_diff) >= 1
+                    else "Previous BRS carry-forward clear requires review"
+                ),
+            }
+        )
 
-    if False and _disc_rows:
+    if _disc_rows:
         _n_low = sum(1 for m in _disc_rows if m["Name Match"] == "Low")
         _n_partial = sum(1 for m in _disc_rows if m["Name Match"] == "Partial")
         _n_amt_diff = sum(1 for m in _disc_rows if m["Diff"] != 0)

@@ -1050,6 +1050,8 @@ def fuzzy(a, b):
     a, b = clean_name(a), clean_name(b)
     if not a or not b:
         return 0
+    if a == b:
+        return 100
     original_score = round(SequenceMatcher(None, a, b).ratio() * 100)
     a_sorted = " ".join(sorted(a.split()))
     b_sorted = " ".join(sorted(b.split()))
@@ -3595,6 +3597,33 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
             if key not in seen:
                 matched_current_book_rows.append(data)
 
+        def _book_only_row_reserved_for_direct_cf(bo_idx, current_item, current_score):
+            """Protect one-to-one CF clears from weaker split/partial clears."""
+            if bo_idx not in book_only.index:
+                return False
+            bo_amt = round(float(book_only.at[bo_idx, "Book Amt (Rs)"] or 0), 2)
+            bo_party = str(book_only.at[bo_idx, "Party"] or "")
+            current_amt = round(float(current_item.get("amount", 0) or 0), 2)
+            current_row = current_item.get("_source_row")
+            for other in prev_brs.get("credited_not_book", []):
+                if other is current_item:
+                    continue
+                if current_row is not None and other.get("_source_row") == current_row:
+                    continue
+                other_amt = round(float(other.get("amount", 0) or 0), 2)
+                if abs(other_amt - bo_amt) >= 0.01:
+                    continue
+                other_score = fuzzy(str(other.get("party", "")), bo_party)
+                if other_score < FUZZY_THRESHOLD and not _truncated_name_match(str(other.get("party", "")), bo_party):
+                    continue
+                # Direct exact-amount rows should win over any partial/split use.
+                if abs(current_amt - bo_amt) >= 0.01:
+                    return True
+                # For same-amount ambiguity, reserve the row for a clearly stronger CF party.
+                if other_score >= FUZZY_THRESHOLD and other_score >= current_score + 10:
+                    return True
+            return False
+
         for bi, br in book_df.iterrows():
             if br["Direction"] != "INFLOW":
                 continue
@@ -3617,6 +3646,11 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 # Skip if this book_only entry was already consumed by a previous CF item
                 if bo_idx_for_br in book_only_indices_to_remove:
                     continue
+                _direct_score = fuzzy(item["party"], br["Party"])
+                if _book_only_row_reserved_for_direct_cf(bo_idx_for_br, item, _direct_score):
+                    print(f"[CF] Check1 skipped: book_only[{bo_idx_for_br}] "
+                          f"Rs{float(br['Book Amt (Rs)']):,.2f} reserved for stronger direct previous-BRS clear")
+                    continue
                 already_recorded = True
                 matched_book_only_idx = bo_idx_for_br
                 matched_book_only_indices.append(bo_idx_for_br)
@@ -3625,18 +3659,13 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 print(f"[CF] Check1 cleared (was book_only): "
                       f"CF={item['party']} Rs{item['amount']:,.2f} <-> book={br['Party']}")
                 break
-            matched_book_only_idx = _find_in_book_only(item["amount"], item["party"])
-            if matched_book_only_idx is None:
-                print(f"[CF] Check1 skipped: CF={item['party']} "
-                      f"Rs{item['amount']:,.2f} matched book={br['Party']} "
-                      f"but that book row is already consumed by current-period matching")
-                continue
-            matched_book_only_indices.append(matched_book_only_idx)
-            _remember_current_book_row(br)
-            already_recorded = True
-            print(f"[CF] Check1 cleared: CF={item['party']} Rs{item['amount']:,.2f} "
-                  f"<-> book={br['Party']}  book_only_idx={matched_book_only_idx}")
-            break
+            # This exact current-book row has already been consumed by normal
+            # current-period matching. Do not use it as a name anchor while
+            # removing a different outstanding book_only row with the same amount.
+            print(f"[CF] Check1 skipped: CF={item['party']} "
+                  f"Rs{item['amount']:,.2f} matched book={br['Party']} "
+                  f"but that exact book row is already consumed by current-period matching")
+            continue
 
         if not already_recorded:
             for bi, br in book_df.iterrows():
@@ -3663,6 +3692,11 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                         print(f"[CF] Check2 skipped: CF={item['party']} "
                               f"Rs{item['amount']:,.2f} matched book={br['Party']} "
                               f"but no outstanding book_only row remains")
+                        continue
+                    _direct_score = fuzzy(item["party"], str(book_only.at[matched_book_only_idx, "Party"]))
+                    if _book_only_row_reserved_for_direct_cf(matched_book_only_idx, item, _direct_score):
+                        print(f"[CF] Check2 skipped: book_only[{matched_book_only_idx}] "
+                              f"reserved for stronger direct previous-BRS clear")
                         continue
                     matched_book_only_indices.append(matched_book_only_idx)
                     _remember_current_book_row(br)
@@ -3735,6 +3769,10 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                         print(f"[CF] Check3 skipped: CF={item['party']} "
                               f"Rs{cf_amt:,.2f} partial book={br['Party']} "
                               f"has no outstanding book_only row")
+                        continue
+                    if _book_only_row_reserved_for_direct_cf(matched_book_only_idx, item, score):
+                        print(f"[CF] Check3 skipped: book_only[{matched_book_only_idx}] "
+                              f"Rs{book_amt:,.2f} reserved for direct previous-BRS clear")
                         continue
                     # FIX (MUMV): When the match is exact-half (CF = 2 x book_amt),
                     # look for a second book_only row of the same party+amount and
@@ -3815,6 +3853,10 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                     score2 = fuzzy(item["party"], str(book_only.at[bi2, "Party"]))
                     if max(score1, score2) < 30:
                         continue
+                    if (_book_only_row_reserved_for_direct_cf(bi1, item, score1) or
+                            _book_only_row_reserved_for_direct_cf(bi2, item, score2)):
+                        print("[CF] Check4b split skipped: book row reserved for direct previous-BRS clear")
+                        continue
                     _in_stmt = any(
                         abs(float(r["Bank Amt (Rs)"]) - cf_amt) < 0.01 and r["Direction"] == "INFLOW"
                         for _, r in stmt_only.iterrows()
@@ -3829,15 +3871,19 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                     break
 
         if not already_recorded:
-            split_candidates = [
-                idx for idx in bo_indices
-                if (
-                    fuzzy(item["party"], str(book_only.at[idx, "Party"])) >= 30 or
-                    bool(_meaningful_words(item["party"]) & _meaningful_words(
-                        f"{book_only.at[idx, 'Party']} {book_only.at[idx, 'Narration']}"
-                    ))
-                )
-            ]
+            split_candidates = []
+            for idx in bo_indices:
+                _split_score = fuzzy(item["party"], str(book_only.at[idx, "Party"]))
+                _split_words_ok = bool(_meaningful_words(item["party"]) & _meaningful_words(
+                    f"{book_only.at[idx, 'Party']} {book_only.at[idx, 'Narration']}"
+                ))
+                if _split_score < 30 and not _split_words_ok:
+                    continue
+                if _book_only_row_reserved_for_direct_cf(idx, item, _split_score):
+                    print(f"[CF] Check4b subset skipped book_only[{idx}]: "
+                          f"reserved for direct previous-BRS clear")
+                    continue
+                split_candidates.append(idx)
             split_idxs = _find_amount_subset(
                 split_candidates,
                 lambda idx: book_only.at[idx, "Book Amt (Rs)"],
@@ -5834,6 +5880,29 @@ def reconcile(book_df, stmt_df):
     # -- Pass 2: Party Name + Direction + Date + Amount (cheque absent/ignored) --
     print("[Reconcile] Pass 2: Party Name + Direction + Date + Amount (cheque absent/ignored)")
     p2_start = len(matched_rows)
+
+    def _stronger_unmatched_book_for_stmt(current_bi, current_br, stmt_row, current_score):
+        """Return True if this bank row has a better same-amount/date book candidate."""
+        for other_bi, other_br in book[~book["_used"]].iterrows():
+            if other_bi == current_bi:
+                continue
+            if other_br.get("_refund_pair", False):
+                continue
+            if other_br["Direction"] != current_br["Direction"]:
+                continue
+            if abs(float(other_br["Book Amt (Rs)"]) - float(current_br["Book Amt (Rs)"])) >= 0.01:
+                continue
+            if not within_date(other_br.get("Date", ""), stmt_row["Date"]):
+                continue
+            if _chq_verdict(other_br["Chq No"], stmt_row["Chq No"]) == "reject":
+                continue
+            other_score = fuzzy(other_br["Party"], stmt_row["Party"])
+            if other_score >= FUZZY_THRESHOLD and other_score > current_score:
+                return True
+            if other_score >= 90 and other_score >= current_score + 10:
+                return True
+        return False
+
     for bi, br in book[~book["_used"]].iterrows():
         if br.get("_refund_pair", False): continue
         book_date = br.get("Date", "")
@@ -5867,7 +5936,12 @@ def reconcile(book_df, stmt_df):
 
         if len(candidates) == 1:
             si = candidates.index[0]; sr = stmt.loc[si]
-            matched_rows.append(_make_row(br, sr, "2-Party+Dir+Date+Amt", fuzzy(br["Party"],sr["Party"])))
+            _score = fuzzy(br["Party"], sr["Party"])
+            if _stronger_unmatched_book_for_stmt(bi, br, sr, _score):
+                print(f"[Reconcile] Pass 2 deferred low-score candidate: "
+                      f"book='{br['Party']}' bank='{sr['Party']}' score={_score}%")
+                continue
+            matched_rows.append(_make_row(br, sr, "2-Party+Dir+Date+Amt", _score))
             book.at[bi, "_used"] = True; stmt.at[si, "_used"] = True
         else:
             def _sort_key(idx):
@@ -5875,7 +5949,12 @@ def reconcile(book_df, stmt_df):
                 d = date_diff(book_date, sr["Date"])
                 return (d if d is not None else 999, -fuzzy(br["Party"], sr["Party"]))
             si = sorted(candidates.index, key=_sort_key)[0]; sr = stmt.loc[si]
-            matched_rows.append(_make_row(br, sr, "2-Party+Dir+Date+Amt(closest)", fuzzy(br["Party"],sr["Party"])))
+            _score = fuzzy(br["Party"], sr["Party"])
+            if _stronger_unmatched_book_for_stmt(bi, br, sr, _score):
+                print(f"[Reconcile] Pass 2 deferred low-score candidate: "
+                      f"book='{br['Party']}' bank='{sr['Party']}' score={_score}%")
+                continue
+            matched_rows.append(_make_row(br, sr, "2-Party+Dir+Date+Amt(closest)", _score))
             book.at[bi, "_used"] = True; stmt.at[si, "_used"] = True
 
     print(f"   -> {len(matched_rows) - p2_start} matched")
@@ -6431,7 +6510,13 @@ def reconcile(book_df, stmt_df):
             (abs(book_only["Book Amt (Rs)"].astype(float) - float(br["Book Amt (Rs)"])) < 0.01) &
             (book_only["Party"] == br["Party"])
         ]
-        if not match_out.empty: book_only.at[bi, "_drop"] = True
+        if not match_out.empty:
+            oi = match_out.index[0]
+            book_only.at[bi, "_drop"] = True
+            book_only.at[oi, "_drop"] = True
+            print(f"[Reconcile] Internal book cancellation: INFLOW Rs{float(br['Book Amt (Rs)']):,.2f} "
+                  f"('{br['Party']}') <-> OUTFLOW Rs{float(book_only.at[oi,'Book Amt (Rs)']):,.2f} "
+                  f"('{book_only.at[oi,'Party']}') -- both dropped from book_only")
 
     book_only = book_only[~book_only["_drop"]].drop(columns=["_drop"])
 
@@ -6440,6 +6525,7 @@ def reconcile(book_df, stmt_df):
     # non-split amount difference, put both legs back into the natural
     # unmatched sections while still keeping the discrepancy row.
     if not matched.empty:
+        _matched_flags = matched.get("Flags", pd.Series("", index=matched.index)).astype(str)
         hard_mismatch_mask = (
             # Any exact match below the manual-confirmation threshold should still
             # be visible in BRS. This includes Pass 2c third-party matches: unique
@@ -6449,8 +6535,6 @@ def reconcile(book_df, stmt_df):
         ) | (
             matched["Amount Match"].astype(str).str.startswith("Diff") &
             (~matched.get("Partial Payment", pd.Series(False, index=matched.index)).astype(bool))
-        ) | matched.get("Flags", pd.Series("", index=matched.index)).astype(str).str.contains(
-            "Cheque no differs", case=False, na=False
         )
         hard_mismatches = matched[hard_mismatch_mask].copy()
         if not hard_mismatches.empty:
@@ -6587,14 +6671,22 @@ def _make_row(br, sr, method, score, partial_note=""):
 
     def _real_chq(value, allow_book_placeholder=False):
         text = str(value or "").strip()
-        absent = {"", "nan", "0", "511", "-"}
-        # Book-side OUTFLOW rows use 99 as an entered cheque value in some reports.
-        # If the bank has a real cheque number, surface 99 vs bank-chq as a mismatch
-        # instead of treating it as absent and silently clearing the debit.
-        if not allow_book_placeholder:
-            absent.add("99")
+        absent = {"", "nan", "0", "99", "511", "-"}
+        # Book-side rows may use 99/511 as placeholder cheque values.
+        # If the bank has a real cheque number, surface placeholder-vs-bank
+        # as a review mismatch instead of silently treating it as absent.
+        if allow_book_placeholder:
+            absent.discard("99")
+            absent.discard("511")
         return text if text.lower() not in absent else ""
 
+    bank_chq = _real_chq(sr.get("Chq No", ""))
+    _book_chq_raw = str(br.get("Chq No", "") or "").strip().lower()
+    _book_placeholder_with_real_bank_chq = (
+        bool(bank_chq) and
+        _book_chq_raw in {"99", "511"} and
+        "[HOT Transfer]" not in str(br.get("Narration", ""))
+    )
     _book_is_payment_chq_review = (
         str(br.get("Direction", "")).upper() == "OUTFLOW" and
         str(br.get("Txn Type", "")).strip().upper() == "PAYMENTS" and
@@ -6602,9 +6694,8 @@ def _make_row(br, sr, method, score, partial_note=""):
     )
     book_chq = _real_chq(
         br.get("Chq No", ""),
-        allow_book_placeholder=_book_is_payment_chq_review
+        allow_book_placeholder=(_book_placeholder_with_real_bank_chq or _book_is_payment_chq_review)
     )
-    bank_chq = _real_chq(sr.get("Chq No", ""))
     chq_note = ""
     if book_chq and bank_chq and book_chq != bank_chq:
         chq_note = f"Cheque no differs: Book={book_chq} Bank={bank_chq}"
@@ -7104,8 +7195,6 @@ def build_brs_sheet(wb, book_only, stmt_only,
         raw_narr = re.sub(r"^CF\s*\|\s*", "", raw_narr, flags=re.IGNORECASE).strip()
         if raw_narr.upper() in ("CF", "CARRIED FWD", "CARRIED FORWARD"):
             raw_narr = ""
-        if raw_narr.lower().startswith("cheque no differs:") or raw_narr.lower().startswith("cheque no. differs:"):
-            raw_narr = ""
         display_narration = raw_narr
 
         def _set(col, val, align="left"):
@@ -7240,6 +7329,45 @@ def build_brs_sheet(wb, book_only, stmt_only,
     HOT_TXN_TYPES = {"Payments", "PAYMENTS", "payments"}
     GENERIC_CHQ_VALS = {"99", "511", "0", "", "nan"}
 
+    def _matched_chq_review_rows(book_direction):
+        """Matched cheque-number differences shown in normal BRS sections.
+        Display only: these rows are already reconciled and must not affect totals.
+        """
+        if matched_df is None or matched_df.empty:
+            return []
+        flags = matched_df.get("Flags", pd.Series("", index=matched_df.index)).astype(str)
+        review_df = matched_df[
+            flags.str.contains("Cheque no differs", case=False, na=False) &
+            (matched_df.get("Book Direction", pd.Series("", index=matched_df.index)).astype(str).str.upper() == book_direction)
+        ]
+        rows = []
+        seen = set()
+        for _, mr in review_df.iterrows():
+            key = (
+                str(mr.get("Book Bill No", "")).strip(),
+                str(mr.get("Book Chq", "")).strip(),
+                str(mr.get("Bank Chq", "")).strip(),
+                round(float(mr.get("Book Amt (Rs)", 0) or 0), 2),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            note = next(
+                (seg for seg in str(mr.get("Flags", "")).split(" | ") if "Cheque no differs" in seg),
+                "Cheque no differs"
+            )
+            rows.append({
+                "Date": mr.get("Book Date", ""),
+                "Txn Type": mr.get("Book Txn", ""),
+                "Bill No": mr.get("Book Bill No", ""),
+                "Chq No": mr.get("Book Chq", ""),
+                "Party": mr.get("Book Party", ""),
+                "Party Raw": mr.get("Book Party Raw", mr.get("Book Party", "")),
+                "Book Amt (Rs)": float(mr.get("Book Amt (Rs)", 0) or 0),
+                "Narration": note,
+            })
+        return rows
+
     def _is_hot_or_internal(row_data):
         """Returns True if this book_only row is an internal HOT transfer that
         must NOT appear in its BRS section:
@@ -7275,7 +7403,8 @@ def build_brs_sheet(wb, book_only, stmt_only,
     section_row("Add :  Cheques issued but not debited in Bank")
     col_header_row("book")
     total_issued = 0.0
-    if issued.empty:
+    _issued_chq_review = _matched_chq_review_rows("OUTFLOW")
+    if issued.empty and not _issued_chq_review:
         nil_row()
     else:
         for _, row_data in issued.iterrows():
@@ -7316,6 +7445,13 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      row_data["Party"], amt, narr, is_cf=False,
                      book_raw=book_raw, bank_raw="", is_rejected=rejected)
             total_issued += amt
+        for row_data in _issued_chq_review:
+            item_row(row_data.get("Date", ""), row_data.get("Txn Type", ""), row_data.get("Bill No", ""),
+                     row_data.get("Chq No", ""), row_data.get("Party", ""),
+                     float(row_data.get("Book Amt (Rs)", 0) or 0), row_data.get("Narration", ""),
+                     is_cf=False, book_raw=str(row_data.get("Party Raw", row_data.get("Party", ""))),
+                     bank_raw="", is_rejected=False)
+            # Display only - already reconciled; do not add to total_issued.
     subtotal_row(total_issued)
     running += total_issued
     running_row(running)
@@ -7422,7 +7558,8 @@ def build_brs_sheet(wb, book_only, stmt_only,
                     "Narration":    _cl.get("narration",""),
                 }))
 
-    if deposited.empty and not _backdated_book_rows:
+    _deposited_chq_review = _matched_chq_review_rows("INFLOW")
+    if deposited.empty and not _backdated_book_rows and not _deposited_chq_review:
         nil_row()
     else:
         for _, row_data in deposited.iterrows():
@@ -7446,6 +7583,13 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      row_data["Party"], amt, narr, is_cf=False,
                      book_raw=book_raw, bank_raw="", is_rejected=rejected)
             total_deposited += amt
+        for row_data in _deposited_chq_review:
+            item_row(row_data.get("Date", ""), row_data.get("Txn Type", ""), row_data.get("Bill No", ""),
+                     row_data.get("Chq No", ""), row_data.get("Party", ""),
+                     float(row_data.get("Book Amt (Rs)", 0) or 0), row_data.get("Narration", ""),
+                     is_cf=False, book_raw=str(row_data.get("Party Raw", row_data.get("Party", ""))),
+                     bank_raw="", is_rejected=False)
+            # Display only - already reconciled; do not add to total_deposited.
         # Show cleared CF book rows - display only, not counted in balance
         _shown_keys = set()
         for _cl, _br in _backdated_book_rows:
@@ -8112,7 +8256,7 @@ def build_verification_sheet(wb, matched, book_only, stmt_only,
                 "amount":       float(mr.get("Book Amt (Rs)", 0) or 0),
                 "difference":   0.00,
                 "issue_type":   "Cheque No. Mismatch",
-                "issue_desc":   f"{chq_detail} - kept in BRS for cheque-number verification",
+                "issue_desc":   chq_detail,
                 "action":       "Manual check",
             })
 
@@ -8293,7 +8437,7 @@ def build_verification_sheet(wb, matched, book_only, stmt_only,
                 continue
             amt    = float(sr.get("Bank Amt (Rs)", 0) or 0)
             narr   = str(sr.get("Narration", sr.get("Description", "")) or "")
-            chq_diff = "chq no. diff" in narr.lower()
+            chq_diff = ("chq no. diff" in narr.lower() or "cheque no differs" in narr.lower())
             issue_type = "Chq No. Mismatch" if chq_diff else "Unrecorded Bank Txn"
             if chq_diff:
                 issue_desc = f"Chq {sr.get('Chq No','')} - book entry has a different cheque number"
@@ -11015,6 +11159,77 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
             print(f"[Process] Post-CF split candidate -> HV Section F: "
                   f"CF book '{_bo_party}' bill={_cf_bill} "
                   f"Rs{_cf_total:,.2f} ({len(_cf_entries)} CF rows) = {_bank_parts_str}")
+
+    # BRS cheque-number difference annotation.
+    # If a book-only row and bank-only row look like the same transaction by
+    # amount/direction/name but carry different cheque numbers, keep both rows
+    # in BRS and show the cheque issue explicitly. This includes book placeholder
+    # cheque values 99/511 when the bank has a real cheque number.
+    if not book_only.empty and not stmt_only.empty:
+        if "Narration" not in book_only.columns:
+            book_only = book_only.copy()
+            book_only["Narration"] = ""
+        if "Narration" not in stmt_only.columns:
+            stmt_only = stmt_only.copy()
+            stmt_only["Narration"] = ""
+
+        def _brs_real_bank_chq(value):
+            text = str(value or "").strip()
+            return text if text.lower() not in {"", "nan", "0", "99", "511", "-"} else ""
+
+        def _brs_book_chq_for_review(value, bank_chq):
+            text = str(value or "").strip()
+            low = text.lower()
+            if low in {"", "nan", "0", "-"}:
+                return ""
+            if low in {"99", "511"}:
+                return text if bank_chq else ""
+            return text
+
+        def _brs_words(text):
+            return {
+                w for w in clean_name(str(text or "")).split()
+                if len(w) >= 4 and w not in {"BANK", "PVT", "LTD", "LIMITED", "PRIVATE", "INDIA"}
+            }
+
+        def _append_brs_note(df, idx, note):
+            old = str(df.at[idx, "Narration"] or "").strip()
+            if note.lower() in old.lower():
+                return
+            df.at[idx, "Narration"] = f"{old} | {note}".strip(" |") if old else note
+
+        for _bo_idx, _bo in book_only.iterrows():
+            _bo_dir = str(_bo.get("Direction", "")).strip()
+            _bo_amt = round(float(_bo.get("Book Amt (Rs)", 0) or 0), 2)
+            if _bo_amt <= 0:
+                continue
+            _best = None
+            _best_score = -1
+            for _si, _sr in stmt_only.iterrows():
+                if str(_sr.get("Direction", "")).strip() != _bo_dir:
+                    continue
+                if abs(round(float(_sr.get("Bank Amt (Rs)", 0) or 0), 2) - _bo_amt) >= 0.01:
+                    continue
+                _bank_chq = _brs_real_bank_chq(_sr.get("Chq No", ""))
+                _book_chq = _brs_book_chq_for_review(_bo.get("Chq No", ""), _bank_chq)
+                if not (_book_chq and _bank_chq and _book_chq != _bank_chq):
+                    continue
+                _score = fuzzy(str(_bo.get("Party", "")), str(_sr.get("Party", "")))
+                _book_words = _brs_words(str(_bo.get("Party", "")))
+                _bank_words = _brs_words(f"{_sr.get('Party', '')} {_sr.get('Description', '')}")
+                if _score < 50 and not (_book_words & _bank_words):
+                    continue
+                if _score > _best_score:
+                    _best = (_si, _book_chq, _bank_chq)
+                    _best_score = _score
+            if _best is None:
+                continue
+            _si, _book_chq, _bank_chq = _best
+            _note = f"chq no. diff: Book={_book_chq} Bank={_bank_chq}"
+            _append_brs_note(book_only, _bo_idx, _note)
+            _append_brs_note(stmt_only, _si, _note)
+            print(f"[Process] BRS cheque diff annotation: {_bo.get('Party', '')} "
+                  f"Rs{_bo_amt:,.2f} Book={_book_chq} Bank={_bank_chq}")
 
     build_excel(
         book_df, stmt_df, matched, book_only, stmt_only,

@@ -378,6 +378,7 @@ def process_gateway_files(
     C_GREEN = "C6EFCE"; C_AMBER = "FFEB9C"; C_RED   = "FFC7CE"
     C_ORNG  = "FCE4D6"; C_GREY  = "F2F2F2"; C_CF    = "E2EFDA"
     C_RED_H = "C00000"; C_PURPL = "EAD1DC"; C_TEAL  = "D0E4F2"
+    C_PURPL_H = "7030A0"
     C_ADD1  = "D6E4F0"
     _BR = _br()
     
@@ -584,7 +585,7 @@ def process_gateway_files(
                     amount=amt,
                     party=str(row.get("Customer Name", "")).strip(),
                     ref=str(row.get("Merchant Txn ID", "")).strip(),
-                    date=_coerce_ts(row.get("AddedOn")),
+                    date=_coerce_ts(row.get("Settlement Date") or row.get("AddedOn")),
                     gateway="PAYU",
                 ))
         for row in cf_rows:
@@ -604,7 +605,7 @@ def process_gateway_files(
                         amount=amt,
                         party=str(detail.get("customer_name", "") or ref).strip(),
                         ref=str(ref).strip(),
-                        date=_coerce_ts(detail.get("event_time") or detail.get("settlement_date")),
+                        date=_coerce_ts(detail.get("settlement_date") or detail.get("event_time")),
                         gateway="CASHFREE",
                     ))
                 continue
@@ -700,7 +701,7 @@ def process_gateway_files(
                 amount=float(row.get("amount", 0.0) or 0.0),
                 remark="Gateway cheque-style deposit pending bank credit",
                 gateway="PAYU",
-                cf=False,
+                cf=False, _auto=True,
             ))
         return dnc_items
     
@@ -756,7 +757,7 @@ def process_gateway_files(
     def parse_new_format_brs_gateway(wb_path):
         """Parse a previous BRS produced by this script (Gateway BRS Statement sheet).
 
-        Supports two layouts — auto-detected from the header row:
+        Supports two layouts â€” auto-detected from the header row:
 
           OLD format (7 cols, pre Book/Bank/Makez change):
             Col A (0): merged label '[GATEWAY]  DATE  |  UTR  |  Party'
@@ -787,7 +788,7 @@ def process_gateway_files(
 
         rows = [tuple(cell.value for cell in row) for row in target.iter_rows()]
 
-        # ── Auto-detect format by scanning the header row for "Book Report" ──
+        # â”€â”€ Auto-detect format by scanning the header row for "Book Report" â”€â”€
         # The new format has "Book Report" as a column header; the old format does not.
         is_new_fmt = False
         is_final_bank_layout = False
@@ -867,29 +868,33 @@ def process_gateway_files(
                 if is_compact_brs_layout:
                     # COMPACT BRS STYLE:
                     # Date | Type | Bill No | Chq No | Book Report/Bank Statement
-                    # | Makez Extracted | Amount | Running Bal | Narration / Remarks
+                    # | Makez Extracted | Amount | Narration / Remarks
+                    # Older generated files may still have Running Bal before the remark.
                     col_b = _v(row, 1)   # Type / gateway tag
                     col_c = _v(row, 2)   # Bill No / UTR
                     col_e = _v(row, 4)   # Book Report / Bank Statement
                     col_f = _v(row, 5)   # Makez Extracted
                     col_g = _v(row, 6)   # Amount
-                    col_i = _v(row, 8)   # Narration / Remarks
+                    col_h = _v(row, 7)   # Narration / Remarks in current layout
+                    col_i = _v(row, 8)   # Narration / Remarks in older running layout
                     amt_col = col_g
-                    remark_col = col_i
+                    remark_col = col_i if col_i not in (None, "") else col_h
                     party = str(col_f or col_e or "").strip()
                 elif is_final_bank_layout:
                     # FINAL-BANK STYLE:
                     # Date | Type | Bill No | Chq No | Book Report | Bank Statement
-                    # | Makez Extracted | Amount | Running Bal | Narration / Remarks
+                    # | Makez Extracted | Amount | Narration / Remarks
+                    # Older generated files may still have Running Bal before the remark.
                     col_b = _v(row, 1)   # Type / gateway tag
                     col_c = _v(row, 2)   # Bill No / UTR
                     col_e = _v(row, 4)   # Book Report
                     col_f = _v(row, 5)   # Bank Statement
                     col_g = _v(row, 6)   # Makez Extracted
                     col_h = _v(row, 7)   # Amount
-                    col_j = _v(row, 9)   # Narration / Remarks
+                    col_i = _v(row, 8)   # Narration / Remarks in current layout
+                    col_j = _v(row, 9)   # Narration / Remarks in older running layout
                     amt_col = col_h
-                    remark_col = col_j
+                    remark_col = col_j if col_j not in (None, "") else col_i
                     party = str(col_g or col_e or col_f or "").strip()
                 else:
                     # NEW format column indices
@@ -899,9 +904,10 @@ def process_gateway_files(
                     col_e = _v(row, 4)   # Bank Statement
                     col_f = _v(row, 5)   # Makez Extracted
                     col_g = _v(row, 6)   # Amount
-                    col_i = _v(row, 8)   # Remark
+                    col_h = _v(row, 7)   # Remark in current no-running layout
+                    col_i = _v(row, 8)   # Remark in older running layout
                     amt_col = col_g
-                    remark_col = col_i
+                    remark_col = col_i if col_i not in (None, "") else col_h
                     party = str(col_f or col_d or col_e or "").strip()
             else:
                 # OLD format column indices
@@ -911,21 +917,21 @@ def process_gateway_files(
                 remark_col = col_g
                 party = None  # extracted from label string
 
-            # ── Closing balance row ──────────────────────────────────────────
+            # â”€â”€ Closing balance row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if "closing balance as per hot gateway book" in label_lower:
                 v = _safe_numeric(amt_col)
                 if v is not None:
                     result["closing_bal"] = v
                 continue
 
-            # ── Bank balance row ─────────────────────────────────────────────
+            # â”€â”€ Bank balance row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if "brs balance" in label_lower:
                 v = _safe_numeric(amt_col)
                 if v is not None:
                     result["bank_bal"] = v
                 continue
 
-            # ── Section header detection ─────────────────────────────────────
+            # â”€â”€ Section header detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             matched_section = None
             for sec_key, keywords in SECTION_MAP.items():
                 if any(kw in label_lower for kw in keywords):
@@ -1093,8 +1099,6 @@ def process_gateway_files(
                 utr    = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
                 party  = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
                 remark = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
-                if not remark:
-                    remark = f"From HOT BRS {key.upper()}"
                 gw = "PAYU"
                 utr_up = utr.upper()
                 if "CASHFREE" in branch.upper() or "AXISCN" in utr_up:
@@ -1201,6 +1205,16 @@ def process_gateway_files(
             running= float(m.group(4).replace(",", ""))
     
             txn_line = all_lines[idx]
+            display_ref = re.sub(
+                r"^\s*\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2}\s+\d{2}-\d{2}-\d{4}\s*",
+                "",
+                txn_line,
+            )
+            display_ref = re.sub(
+                r"\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s+[\d,]+\.\d{2}\s*$",
+                "",
+                display_ref,
+            ).strip() or txn_line.strip()
             tail_window = "\n".join(all_lines[idx:min(len(all_lines), idx + 4)])
             wide_window = "\n".join(all_lines[max(0, idx - 2):min(len(all_lines), idx + 5)])
 
@@ -1240,11 +1254,32 @@ def process_gateway_files(
                 dup += 1; ref = f"{base_ref}_D{dup}"
             seen_refs.add(ref)
     
-            bank_txns.append(dict(date=date, ref=ref, debit=debit,
+            bank_txns.append(dict(date=date, ref=ref, display_ref=display_ref, debit=debit,
                                    credit=credit, running=running, source=source))
             if credit > 0:
                 credits_by_ref[base_ref] = credits_by_ref.get(base_ref, 0.0) + credit
     
+        # If the statement spans multiple days, filter to BRS_DATE only and
+        # recompute the closing balance from those transactions alone.
+        txn_dates = {t["date"] for t in bank_txns}
+        if len(txn_dates) > 1:
+            # Convert BRS_DATE (DD.MM.YYYY) â†’ PDF date format (DD-MM-YYYY)
+            brs_pdf_date = BRS_DATE.replace(".", "-")
+            bank_txns_all = bank_txns
+            bank_txns = [t for t in bank_txns_all if t["date"] == brs_pdf_date]
+            # Recompute credits_by_ref for filtered transactions only
+            credits_by_ref = {}
+            for t in bank_txns:
+                if t["credit"] > 0:
+                    base = re.sub(r"_D\d+$", "", t["ref"])
+                    credits_by_ref[base] = credits_by_ref.get(base, 0.0) + t["credit"]
+            # Closing balance = last running balance of the filtered day
+            if bank_txns:
+                bank_close = bank_txns[-1]["running"]
+            print(f"[PDF-DATE-FILTER] Statement has {len(txn_dates)} days; "
+                  f"filtered to {brs_pdf_date} â†’ {len(bank_txns)} txns, "
+                  f"day-end balance={bank_close:,.2f}")
+
         return bank_txns, credits_by_ref, bank_open, bank_close
     
     #  GATEWAY LOADERS
@@ -1484,7 +1519,11 @@ def process_gateway_files(
     other_pool = {r: a for r, a in credits_by_ref.items()
                   if r not in rtgs_pool and r not in neft_pool and r not in upi_pool}
     
-    df_all = pd.read_excel(ALL_BRANCHES_FILE, engine="xlrd", header=None)
+    def _xls_engine(path):
+        """Return the correct pandas Excel engine based on file extension."""
+        return "xlrd" if str(path).lower().endswith(".xls") else "openpyxl"
+
+    df_all = pd.read_excel(ALL_BRANCHES_FILE, engine=_xls_engine(ALL_BRANCHES_FILE), header=None)
     SKIP_BR = {"Transaction","GATEWAY","Public Sale","Receipts","Payments",
                "Summary Of GATEWAY","Opening Balance","nan",""}
     cur_br = None; bl = []
@@ -1511,7 +1550,7 @@ def process_gateway_files(
     hot_hot_pay    = ap_all[ap_all["party"] == "HOT - HOT"].copy()
     total_all_pay  = hot_hot_pay["amount"].sum()
     
-    df_hot = pd.read_excel(HOT_BOOK_FILE, engine="xlrd", header=None)
+    df_hot = pd.read_excel(HOT_BOOK_FILE, engine=_xls_engine(HOT_BOOK_FILE), header=None)
     hot_rec_raw          = df_hot[df_hot[0] == "Receipts"].copy()
     hot_rec_raw["amount"]= pd.to_numeric(hot_rec_raw[7], errors="coerce").fillna(0)
     hot_rec_raw["party"] = hot_rec_raw[6].astype(str)
@@ -1670,7 +1709,7 @@ def process_gateway_files(
                 dnc_items.append(dict(date=BRS_DATE, branch="HOT", utr=utr,
                                       party=f"{gw_name} settlement", amount=net,
                                       remark=f"{gw_name} settled -- pending bank credit",
-                                      gateway=gw_name, cf=False))
+                                      gateway=gw_name, cf=False, _auto=True))
             brs_rows.append(dict(UTR=utr, Gross=gross, Net=net, Fees=fees, Tax=tax,
                                  FeesTotal=fees_t, Bank_Credit=bank_amt, Difference=diff,
                                  Status=status, Color=color, CreditType=credit_type, **extra))
@@ -1784,7 +1823,7 @@ def process_gateway_files(
                             party="ON_DEMAND_CREDIT",
                             amount=net,
                             remark="OND settlement -- credited in bank, not yet in book",
-                            gateway="OND", cf=False,
+                            gateway="OND", cf=False, _auto=True,
                         ))
             except Exception as e:
                 print(f"[WARN] OND CNB read failed for {od_file}: {e}")
@@ -1818,7 +1857,7 @@ def process_gateway_files(
                         date=dt, branch="HOT", utr=utr,
                         party=party, amount=amt,
                         remark="Prior-day PayU txn -- credited in bank today, not yet in book",
-                        gateway="PAYU-GW", cf=False,
+                        gateway="PAYU-GW", cf=False, _auto=True,
                     ))
                 else:
                     print(f"[WARN] --cnb-utrs: UTR '{utr}' not found in PayU SUCCESS rows")
@@ -1832,17 +1871,17 @@ def process_gateway_files(
         all_cnb_new.append(dict(date=BRS_DATE, branch="HOT", utr=ref,
                                 party="RTGS credit (unmatched)",
                                 amount=amt, remark="Bank RTGS -- not matched to any gateway",
-                                gateway="RTGS-OTHER", cf=False))
+                                gateway="RTGS-OTHER", cf=False, _auto=True))
     for ref, amt in list(neft_pool.items()):
         all_cnb_new.append(dict(date=BRS_DATE, branch="HOT", utr=ref,
                                 party="NEFT credit (unmatched)",
                                 amount=amt, remark="Bank NEFT -- not matched to any gateway",
-                                gateway="NEFT-OTHER", cf=False))
+                                gateway="NEFT-OTHER", cf=False, _auto=True))
     for ref, amt in list(other_pool.items()):
         all_cnb_new.append(dict(date=BRS_DATE, branch="HOT", utr=ref,
                                 party="Other credit (unmatched)",
                                 amount=amt, remark="Bank credit -- not matched to any gateway",
-                                gateway="OTHER", cf=False))
+                                gateway="OTHER", cf=False, _auto=True))
     
     total_gw_all   = sum(g["gw_net"]    for g in gateway_results)
     total_bank_all = sum(g["bank_total"] for g in gateway_results)
@@ -1856,14 +1895,14 @@ def process_gateway_files(
             add1_cf.append({**item, "cf": True,
                             "remark": item.get("remark","") or "CF -- Issued not yet debited"})
         for item in hot_brs_data["dnc"]:
-            dnc_cf.append({**item, "cf": False,
-                           "remark": item.get("remark","") or "CF from prev BRS DNC"})
+            dnc_cf.append({**item, "cf": True,
+                           "remark": item.get("remark","")})
         for item in hot_brs_data["less2"]:
             if _book_has_reference(book_evidence_rows, item.get("utr", "")):
                 print(f"[CF-CLOSE] Less2 resolved in today's books: {item.get('utr','')} | {item.get('party','')} | {item.get('amount',0):,.2f}")
                 continue
             less2_cf.append({**item, "cf": False,
-                             "remark": item.get("remark","") or "CF -- Bank debit not in book"})
+                             "remark": item.get("remark","")})
         less2_cf_ref_keys = {_normalise_ref_token(i.get("utr", "")) for i in less2_cf} - {""}
         for item in hot_brs_data["cnb"]:
             is_bc_item = str(item.get("party", "")).strip().upper().startswith("BC ")
@@ -2179,7 +2218,7 @@ def process_gateway_files(
                 _add_less2(dict(date=dt, branch="PAYU", utr=utr,
                                 party="ON_DEMAND_DEBIT CHARGES", amount=charge,
                                 remark="OND charge -- debited by bank, not in book",
-                                gateway="OND-CHARGE", cf=False))
+                                gateway="OND-CHARGE", cf=False, _auto=True))
         except Exception as e:
             print(f"[WARN] OND charge read failed for {od_file}: {e}")
 
@@ -2212,7 +2251,7 @@ def process_gateway_files(
                 amount=charge,
                 remark="OND reversal charge -- debited by bank, not in book",
                 gateway="OND-CHARGE",
-                cf=False,
+                cf=False, _auto=True,
             ))
     
     dnc_all = []
@@ -2233,7 +2272,7 @@ def process_gateway_files(
                               party="Other credit (unmatched)",
                               amount=amt,
                               remark="Bank credit -- no matching gateway pattern",
-                              gateway="OTHER", cf=False))
+                              gateway="OTHER", cf=False, _auto=True))
     
     _ond_cnb_items = [i for i in all_cnb_new if i.get("gateway") == "OND"]
     _non_ond_cnb   = [i for i in all_cnb_new if i.get("gateway") != "OND"]
@@ -2279,7 +2318,7 @@ def process_gateway_files(
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
-                cf=False,
+                cf=False, _auto=True,
             )
             if amt > 100 and _is_book_resolved(item, book_evidence_rows):
                 continue
@@ -2354,7 +2393,7 @@ def process_gateway_files(
                 amount=amt,
                 remark="Auto CNB -- CashFree reconciliation-detail txn credited in bank, not in book",
                 gateway="CASHFREE-GW",
-                cf=False,
+                cf=False, _auto=True,
             )
             if _is_book_resolved(item, book_evidence_rows):
                 continue
@@ -2396,6 +2435,21 @@ def process_gateway_files(
         name_thresh=70,
         matches=backdated_credit_matches,
     )
+    if dnc_cf:
+        _existing_dnc_keys = {_section_key(item) for item in dnc_all}
+        _prev_dnc_pending = []
+        for item in dnc_cf:
+            key = _section_key(item)
+            if key in _existing_dnc_keys:
+                continue
+            _prev_dnc_pending.append({
+                **item,
+                "cf": True,
+                "remark": item.get("remark", ""),
+            })
+            _existing_dnc_keys.add(key)
+        if _prev_dnc_pending:
+            dnc_all = _prev_dnc_pending + dnc_all
     cnb_all = _prev_cnb_items + _current_cnb_items
     dnc_ids = {_norm(i["utr"]) for i in dnc_all} - {""}
     cnb_ids = {_norm(i["utr"]) for i in cnb_all} - {""}
@@ -2485,7 +2539,7 @@ def process_gateway_files(
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
-                cf=False,
+                cf=False, _auto=True,
             )
             if _matches_section_single_amount(item, dnc_cf):
                 continue
@@ -2525,7 +2579,7 @@ def process_gateway_files(
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
-                cf=False,
+                cf=False, _auto=True,
             ))
         source_fill = _find_subset_sum_items(source_candidates, abs(prelim_bank_bal), tolerance_rupees=1)
         if source_fill:
@@ -2581,7 +2635,7 @@ def process_gateway_files(
                 amount=float(row.get("Amount", 0.0) or 0.0),
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
-                cf=False,
+                cf=False, _auto=True,
             ))
         if "20260311636895" not in {_normalise_ref_token(i.get("utr", "")) for i in cnb_all}:
             cnb_all.append(dict(
@@ -2592,7 +2646,7 @@ def process_gateway_files(
                 amount=33.0,
                 remark="Auto CNB -- CashFree txn credited in bank, not in book",
                 gateway="CASHFREE-GW",
-                cf=False,
+                cf=False, _auto=True,
             ))
         less2_all = [
             item for item in less2_all
@@ -2607,7 +2661,7 @@ def process_gateway_files(
                 amount=9181.0,
                 remark="PayU refund -- debited in bank, not in book",
                 gateway="PAYU",
-                cf=False,
+                cf=False, _auto=True,
             ))
 
         dnc_ids = {_norm(i["utr"]) for i in dnc_all} - {""}
@@ -2641,7 +2695,7 @@ def process_gateway_files(
                     amount=float(row.get("amount", 0.0) or 0.0),
                     remark="Gateway cheque-style deposit pending bank credit",
                     gateway="PAYU",
-                    cf=False,
+                    cf=False, _auto=True,
                 ))
 
         cnb_remove = {
@@ -2681,7 +2735,7 @@ def process_gateway_files(
                 amount=float(row.get("Amount", 0.0) or 0.0),
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
-                cf=False,
+                cf=False, _auto=True,
             ))
             existing_cnb.add(key)
         if not any(_normalise_ref_token(i.get("utr", "")) == "20260310395257" for i in less2_all):
@@ -2695,7 +2749,7 @@ def process_gateway_files(
                     amount=abs(float(row.get("Amount(Net)", row.get("Amount", 0.0)) or 0.0)),
                     remark="PayU refund -- debited in bank, not in book",
                     gateway="PAYU",
-                    cf=False,
+                    cf=False, _auto=True,
                 ))
 
         dnc_ids = {_norm(i["utr"]) for i in dnc_all} - {""}
@@ -2713,12 +2767,12 @@ def process_gateway_files(
     _ol_l2_cnb  = _meaningful(less2_ids & cnb_ids)
     _ol_dnc_cnb = _meaningful(dnc_ids   & cnb_ids)
     
-    if _ol_l2_dnc:  print(f"  OVERLAP ERROR Less2∩DNC : {_ol_l2_dnc}")
-    if _ol_l2_cnb:  print(f"  OVERLAP INFO Less2∩CNB : {_ol_l2_cnb} (expected - debit+refund)")
-    if _ol_dnc_cnb: print(f"  OVERLAP ERROR DNC∩CNB   : {_ol_dnc_cnb}")
+    if _ol_l2_dnc:  print(f"  OVERLAP ERROR Less2âˆ©DNC : {_ol_l2_dnc}")
+    if _ol_l2_cnb:  print(f"  OVERLAP INFO Less2âˆ©CNB : {_ol_l2_cnb} (expected - debit+refund)")
+    if _ol_dnc_cnb: print(f"  OVERLAP ERROR DNCâˆ©CNB   : {_ol_dnc_cnb}")
     
-    assert not _ol_l2_dnc,  f"PARTITION FAIL Less2∩DNC: {_ol_l2_dnc}"
-    assert not _ol_dnc_cnb, f"PARTITION FAIL DNC∩CNB:   {_ol_dnc_cnb}"
+    assert not _ol_l2_dnc,  f"PARTITION FAIL Less2âˆ©DNC: {_ol_l2_dnc}"
+    assert not _ol_dnc_cnb, f"PARTITION FAIL DNCâˆ©CNB:   {_ol_dnc_cnb}"
     
     total_add1  = sum(i["amount"] for i in add1_all)
     total_dnc   = sum(i["amount"] for i in dnc_all)
@@ -2789,7 +2843,7 @@ def process_gateway_files(
 
     dnc_brs_bills = {_norm(i.get("utr", "")) for i in dnc_all} - {""}
 
-    # ── Build cheque match report (name + amount matching: book PS entries vs PayU) ─
+    # â”€â”€ Build cheque match report (name + amount matching: book PS entries vs PayU) â”€
     # For each PS book entry, find the best matching PayU transaction using:
     #   1. Exact bill-number match via bank statement reference
     #   2. Name + amount match against PayU customer names (primary method)
@@ -2868,7 +2922,7 @@ def process_gateway_files(
         ps_date   = ps_row["date"]
         book_date_str = ps_date.strftime("%d.%m.%Y") if pd.notna(ps_date) else ""
 
-        # ── Priority 1: Direct bill-number match in bank statement ────────────
+        # â”€â”€ Priority 1: Direct bill-number match in bank statement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if bill in backdated_credit_by_bill:
             backdated = backdated_credit_by_bill[bill]
             amt_diff = ps_amount - float(backdated.get("amount", 0.0) or 0.0)
@@ -2899,7 +2953,7 @@ def process_gateway_files(
                 verdict  = "MATCHED" if amt_diff < 1 else "REVIEW"
                 reason   = ("Bill number directly matched in bank statement"
                             if amt_diff < 1 else
-                            f"Bill matched but amount differs by Rs {amt_diff:,.2f} — verify")
+                            f"Bill matched but amount differs by Rs {amt_diff:,.2f} â€” verify")
                 cheque_match_report.append(dict(
                     book_date=book_date_str,
                     book_bill=bill,
@@ -2916,7 +2970,7 @@ def process_gateway_files(
                 ))
                 continue
 
-        # ── Check if this entry is in DNC (deposited but not yet credited) ───
+        # â”€â”€ Check if this entry is in DNC (deposited but not yet credited) â”€â”€â”€
         bill_norm_key = _norm(bill)
         if bill_norm_key in dnc_brs_bills:
             # Still try name+amount match against gateway pool to confirm identity
@@ -2931,7 +2985,7 @@ def process_gateway_files(
                 if combined > best_gw_score:
                     best_gw_score = combined; best_gw = _gw; best_nm = nm_label
             if best_gw and best_gw_score >= 70:
-                reason = (f"DNC — Gateway match confirmed: {best_gw['gateway']} "
+                reason = (f"DNC â€” Gateway match confirmed: {best_gw['gateway']} "
                           f"party='{best_gw['party']}' (score {best_gw_score}%)")
                 cheque_match_report.append(dict(
                     book_date=book_date_str,
@@ -2964,7 +3018,7 @@ def process_gateway_files(
                 ))
             continue
 
-        # ── Priority 2: Name + Amount match against gateway transactions ──────
+        # â”€â”€ Priority 2: Name + Amount match against gateway transactions â”€â”€â”€â”€â”€â”€
         # Score = name_match_score + bonuses for exact amount, date proximity
         best_gw = None; best_gw_score = 0; best_nm_label = ""; best_nm_score = 0
         for _gw in _payu_match_pool:
@@ -3008,13 +3062,13 @@ def process_gateway_files(
                 amount_diff=amt_diff,
                 verdict=verdict,
                 verdict_reason=(
-                    f"Name matched ({best_nm_label}, {best_nm_score}%) via {best_gw['gateway']} — "
+                    f"Name matched ({best_nm_label}, {best_nm_score}%) via {best_gw['gateway']} â€” "
                     f"'{best_gw['party']}'"
-                    + (f" | Amt diff Rs {amt_diff:,.2f} — verify" if amt_diff >= 1 else "")
+                    + (f" | Amt diff Rs {amt_diff:,.2f} â€” verify" if amt_diff >= 1 else "")
                 ),
             ))
         elif best_gw and best_gw_score >= 60:
-            # Partial / weaker match — flag for review
+            # Partial / weaker match â€” flag for review
             amt_diff = abs(ps_amount - best_gw["amount"])
             cheque_match_report.append(dict(
                 book_date=book_date_str,
@@ -3029,8 +3083,8 @@ def process_gateway_files(
                 amount_diff=amt_diff,
                 verdict="REVIEW",
                 verdict_reason=(
-                    f"Partial name match ({best_nm_label}, {best_nm_score}%) via {best_gw['gateway']} — "
-                    f"'{best_gw['party']}' — verify before confirming"
+                    f"Partial name match ({best_nm_label}, {best_nm_score}%) via {best_gw['gateway']} â€” "
+                    f"'{best_gw['party']}' â€” verify before confirming"
                 ),
             ))
         else:
@@ -3235,7 +3289,7 @@ def process_gateway_files(
                 "Additional Service Tax",
                 "Priority Settlement Tax",
             ])
-            # ── FIX: include ALL rows with a valid amount, even if fees are zero.
+            # â”€â”€ FIX: include ALL rows with a valid amount, even if fees are zero.
             # Previously only rows with non-zero fees were appended, causing
             # transactions with genuinely zero fees to fall through to
             # _proportional_fees which returns (0,0) for uncredited/DNC bills.
@@ -3248,21 +3302,21 @@ def process_gateway_files(
                 svc_fee=svc_fee,
             ))
 
-    # ── FIXED: _fees_for_book_entry ───────────────────────────────────────────────
+    # â”€â”€ FIXED: _fees_for_book_entry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Previous version fell through to _proportional_fees (returns zeros for
     # uncredited/DNC bills) whenever:
     #   (a) multiple near-amount candidates existed but none had a strong name match, OR
-    #   (b) no candidates fell within the tight ±0.5% / ±₹50 window.
+    #   (b) no candidates fell within the tight Â±0.5% / Â±â‚¹50 window.
     #
     # Fix: when name matching is inconclusive, pick the closest-amount candidate
-    # rather than giving up. Also add a wider-tolerance second pass (±5% / ±₹500)
+    # rather than giving up. Also add a wider-tolerance second pass (Â±5% / Â±â‚¹500)
     # before falling back to proportional allocation.
     def _fees_for_book_entry(bill, party, amount):
         amount = float(amount or 0.0)
         if amount <= 0:
             return 0.0, 0.0
 
-        # --- Pass 1: tight window (±₹50 or ±0.5%) ---
+        # --- Pass 1: tight window (Â±â‚¹50 or Â±0.5%) ---
         near_amount = [
             item for item in _payu_fee_rows
             if abs(float(item["amount"]) - amount) <= max(50.0, amount * 0.005)
@@ -3282,16 +3336,16 @@ def process_gateway_files(
                 )[0]
                 return round(best["proc_fee"], 2), round(best["svc_fee"], 2)
 
-            # Single candidate — use it regardless of name match
+            # Single candidate â€” use it regardless of name match
             if len(near_amount) == 1:
                 only = near_amount[0]
                 return round(only["proc_fee"], 2), round(only["svc_fee"], 2)
 
-            # Multiple candidates, no name match — pick closest amount
+            # Multiple candidates, no name match â€” pick closest amount
             best_by_amt = min(near_amount, key=lambda item: abs(float(item["amount"]) - amount))
             return round(best_by_amt["proc_fee"], 2), round(best_by_amt["svc_fee"], 2)
 
-        # --- Pass 2: wider window (±₹500 or ±5%) to catch minor rounding differences ---
+        # --- Pass 2: wider window (Â±â‚¹500 or Â±5%) to catch minor rounding differences ---
         wide_match = [
             item for item in _payu_fee_rows
             if abs(float(item["amount"]) - amount) <= max(500.0, amount * 0.05)
@@ -3311,13 +3365,13 @@ def process_gateway_files(
                 )[0]
                 return round(best["proc_fee"], 2), round(best["svc_fee"], 2)
 
-            # No name match — take the closest-amount candidate
+            # No name match â€” take the closest-amount candidate
             best_by_amt = min(wide_match, key=lambda item: abs(float(item["amount"]) - amount))
             return round(best_by_amt["proc_fee"], 2), round(best_by_amt["svc_fee"], 2)
 
         # --- Pass 3: UTR-level proportional allocation (last resort) ---
         # Works for credited bills (bill_to_bank_ref populated).
-        # Returns (0, 0) for DNC/uncredited bills — acceptable as a genuine fallback.
+        # Returns (0, 0) for DNC/uncredited bills â€” acceptable as a genuine fallback.
         return _proportional_fees(bill, amount)
 
     _amt_to_gw = {}
@@ -3328,19 +3382,35 @@ def process_gateway_files(
             str(gw_item.get("gateway", "PAYU")),
         ))
 
-    def _resolve_gateway(ps_party, ps_amount):
-        amt_key = round(float(ps_amount or 0), 2)
-        candidates = _amt_to_gw.get(amt_key, [])
-        if not candidates:
-            return "PAYU"
+    def _best_gateway_match(ps_party, ps_amount):
+        ps_amt = float(ps_amount or 0.0)
         ps_norm = _normalise_name(str(ps_party))
-        best_gw, best_score = "PAYU", -1
-        for cand_norm, gw_name in candidates:
-            score = _name_match_score(ps_norm, cand_norm)
+        best = None
+        best_score = -1
+        for item in gateway_customer_pool:
+            gw_amt = float(item.get("amount", 0.0) or 0.0)
+            amt_diff = abs(gw_amt - ps_amt)
+            if amt_diff > max(100.0, ps_amt * 0.02):
+                continue
+            score = _name_match_score(ps_norm, item.get("party", ""))
+            if amt_diff < 1:
+                score += 30
+            elif amt_diff <= 10:
+                score += 15
             if score > best_score:
-                best_score, best_gw = score, gw_name
-        return best_gw
+                best_score = score
+                best = item
+        return best if best_score >= 65 else None
 
+    def _resolve_gateway(ps_party, ps_amount):
+        match = _best_gateway_match(ps_party, ps_amount)
+        return str(match.get("gateway", "PAYU")) if match else "PAYU"
+
+    def _fmt_gateway_date(value):
+        ts = _coerce_ts(value)
+        if ts is None or pd.isna(ts):
+            return ""
+        return ts.strftime("%d.%m.%Y")
     # Build bill -> gateway txn/merchant UTR lookup from cheque_match_report
     # bank_ref in cheque_match_report is: bank UTIBR ref (credited) or gateway Merchant UTR/txn_id (DNC match)
     # We want the gateway-side txn_id separately so we can show both bank ref AND gateway ref
@@ -3355,7 +3425,7 @@ def process_gateway_files(
         gw_ref = ""
         gw_nm  = ""
         vr     = rec.get("verdict_reason", "")
-        # Extract gateway name from verdict reason e.g. "... via PAYU — 'Name'"
+        # Extract gateway name from verdict reason e.g. "... via PAYU â€” 'Name'"
         gw_nm_m = re.search(r"via (\w+)", vr)
         if gw_nm_m:
             gw_nm = gw_nm_m.group(1)
@@ -3385,15 +3455,15 @@ def process_gateway_files(
 
     NF = "#,##0.00"
 
-    # ─── Sheet 1: Cheque Deposits ─────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 1: Cheque Deposits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws10 = wb.active; ws10.title = "Cheque Deposits"
-    col_w(ws10, [14, 10, 8, 16, 38, 10, 12, 42, 14, 14, 14, 30])
+    col_w(ws10, [14, 10, 8, 38, 10, 12, 42, 14, 14, 14, 30])
     ws10.freeze_panes = "A3"
     r = 1
     write_title(ws10, r,
-        f"Cheque Deposit — Gateway Book Entries  |  YES BANK  |  {BRS_DATE}", 12); r += 1
+        f"Cheque Deposit â€” Gateway Book Entries  |  YES BANK  |  {BRS_DATE}", 11); r += 1
     write_hdr(ws10, r,
-        ["Date", "Branch", "Bank", "Bill No.", "UTR No. (Bank Ref) | GW Txn ID", "Cheque No.", "Gateway",
+        ["Date", "Branch", "Bank", "UTR No. (Bank Ref) | GW Txn ID", "Cheque No.", "Gateway",
          "Party Name", "Amount (Rs)", "Proc Fee (Rs)", "Svc Fee (Rs)", "Narration"])
     for _, row in ps_all.iterrows():
         r += 1
@@ -3404,10 +3474,15 @@ def process_gateway_files(
         bank_utr  = bill_to_bank_ref.get(bill, "")
         gw_txn    = bill_to_gw_txn.get(bill, "")
         bill_norm = _norm(bill)
-        gw_name   = _resolve_gateway(row["party"], row["amount"])
+        gw_match  = _best_gateway_match(row["party"], row["amount"])
+        gw_name   = str(gw_match.get("gateway", "PAYU")) if gw_match else _resolve_gateway(row["party"], row["amount"])
+        if not gw_txn and gw_match:
+            gw_txn = str(gw_match.get("ref", "") or "").strip()
         pf, st    = _fees_for_book_entry(bill, row["party"], row["amount"])
-        narration = (f"CREDITED AS ON {bank_dt}"        if bank_dt
-                     else "DEPOSITED — NOT YET CREDITED" if bill_norm in dnc_brs_bills
+        gw_date   = _fmt_gateway_date(gw_match.get("date")) if gw_match else ""
+        display_dt = bank_dt or gw_date
+        narration = (f"CREDITED AS ON {display_dt}"      if display_dt
+                     else "DEPOSITED - NOT YET CREDITED" if bill_norm in dnc_brs_bills
                      else "")
         # Build combined UTR display:
         # Credited: "UTIBR7... | GW_TXN_ID"
@@ -3417,15 +3492,15 @@ def process_gateway_files(
             utr_display = f"{base_ref}  |  {gw_txn}"
         else:
             utr_display = base_ref
-        right_cols = {9, 10, 11}
+        right_cols = {8, 9, 10}
         for c, v in enumerate(
-                [dt, row["branch"], "GATEWAY", bill, utr_display, 511, gw_name,
+                [dt, row["branch"], "GATEWAY", utr_display, 511, gw_name,
                  party, row["amount"], pf or None, st or None, narration], 1):
             sc(ws10, r, c, v,
                h_align="right" if c in right_cols else "left",
                num_fmt=NF if c in right_cols else None)
 
-    # ─── Sheet 2: All-Branches Book ──────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 2: All-Branches Book â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws1 = wb.create_sheet("Book Entries (All Branches)")
     col_w(ws1, [14,10,8,16,38,10,42,14,52]); ws1.freeze_panes = "A3"
     r = 1
@@ -3446,7 +3521,7 @@ def process_gateway_files(
                                 "INDIVI - "+row["party"], row["amount"], narr], 1):
             sc(ws1, r, c, v, h_align="right" if c==8 else "left", num_fmt=NF if c==8 else None)
     
-    # ─── Sheet 3: HOT Receipts ───────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 3: HOT Receipts â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws2 = wb.create_sheet("HOT Receipts (Filtered)")
     col_w(ws2, [14,10,14,10,42,14,52]); ws2.freeze_panes = "A3"
     r = 1
@@ -3466,20 +3541,7 @@ def process_gateway_files(
             for c, v in enumerate([dt,"HOT",str(row[3]),str(row[4]),str(row[6])[:50],row["amount"],row["narr"][:60]], 1):
                 sc(ws2, r, c, v, bg=C_AMBER, h_align="right" if c==6 else "left", num_fmt=NF if c==6 else None)
     
-    # ─── Sheet 4: HOT Settlements ────────────────────────────────────────────────
-    ws3 = wb.create_sheet("HOT Settlements")
-    col_w(ws3, [14,14,8,10,16,52]); ws3.freeze_panes = "A3"
-    r = 1
-    write_title(ws3, r, f"HOT Settlement Payments -- All Branches to HOT Gateway  |  {BRS_DATE}", 6); r += 1
-    write_hdr(ws3, r, ["Date","Bill No.","Chq No.","Branch","Amount (Rs)","Narration"])
-    for _, row in hot_hot_pay.iterrows():
-        r += 1
-        dt = row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else ""
-        narr = str(row[13])[:100] if 13 in row.index and pd.notna(row[13]) else ""
-        for c, v in enumerate([dt, row["bill_no"], 99, row["branch"], row["amount"], narr], 1):
-            sc(ws3, r, c, v, h_align="right" if c==5 else "left", num_fmt=NF if c==5 else None)
-    
-    # ─── Sheet 5: YES Bank Statement ─────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 5: YES Bank Statement â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws4 = wb.create_sheet("YES Bank Statement")
     col_w(ws4, [14,34,16,16,16,18]); ws4.freeze_panes = "A3"
     r = 1
@@ -3489,7 +3551,7 @@ def process_gateway_files(
     for txn in bank_txns:
         r += 1
         bg = SRC_COLOR.get(txn["source"])
-        for c, v in enumerate([txn["date"], txn["ref"],
+        for c, v in enumerate([txn["date"], txn.get("display_ref", txn["ref"]),
                                 txn["credit"] if txn["credit"] > 0 else None,
                                 txn["debit"]  if txn["debit"]  > 0 else None,
                                 txn["running"], txn["source"]], 1):
@@ -3502,7 +3564,7 @@ def process_gateway_files(
     ).font = Font(name="Calibri", size=9, bold=True)
     ws4.cell(r, 1).alignment = align(); ws4.cell(r, 1).fill = fill(C_GREY); ws4.cell(r, 1).border = _BR
     
-    # ─── Sheet 6: Gateway BRS (All) ──────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 6: Gateway BRS (All) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws5 = wb.create_sheet("Gateway BRS (All)")
     col_w(ws5, [16,30,10,16,14,14,16,16,14,40]); ws5.freeze_panes = "A3"
     r = 1
@@ -3558,7 +3620,7 @@ def process_gateway_files(
            h_align="right" if c in range(4,10) else "left",
            num_fmt=NF if c in range(4,10) else None)
     
-    # ─── Sheet 7: PayU Transactions ──────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 7: PayU Transactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws6 = wb.create_sheet("PayU Transactions")
     col_w(ws6, [22,24,10,14,14,14,14,14,10,18]); ws6.freeze_panes = "A3"
     r = 1
@@ -3591,7 +3653,7 @@ def process_gateway_files(
             sc(ws6, r, c, v, bg=bg, h_align="right" if c in range(2,9) else "left",
                num_fmt=NF if c in [3,4,5,6,7,8] else None)
     
-    # ─── Sheet 8: PayU On-Demand Detail ──────────────────────────────────────────
+    # â”€â”€â”€ Sheet 8: PayU On-Demand Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws_od = wb.create_sheet("PayU On-Demand Detail")
     col_w(ws_od, [22,30,10,16,14,14,14,14]); ws_od.freeze_panes = "A3"
     r = 1
@@ -3625,7 +3687,7 @@ def process_gateway_files(
     else:
         r += 1; sc(ws_od, r, 1, "No PayU On-Demand files provided.", bg=C_AMBER)
     
-    # ─── Sheet 9: CashFree Detail ────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 9: CashFree Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws8 = wb.create_sheet("CashFree Detail")
     col_w(ws8, [14,22,16,16,16,22,16,14,14,14]); ws8.freeze_panes = "A3"
     r = 1
@@ -3648,7 +3710,7 @@ def process_gateway_files(
     else:
         r += 1; sc(ws8, r, 1, "No CashFree file provided.", bg=C_AMBER)
     
-    # ─── Sheet 10: EaseBuzz Detail ───────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 10: EaseBuzz Detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws7 = wb.create_sheet("EaseBuzz Detail")
     col_w(ws7, [8,24,24,22,14,14,14,14,14]); ws7.freeze_panes = "A3"
     r = 1
@@ -3684,23 +3746,22 @@ def process_gateway_files(
     else:
         r += 1; sc(ws7, r, 1, "No EaseBuzz file provided.", bg=C_AMBER)
     
-    # ─── Sheet 11.5: Matched ────────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 11.5: Matched â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws_match = wb.create_sheet("Matched")
     col_w(ws_match, [18, 12, 7, 16,
-                     11, 12, 10, 10, 28, 8, 28, 28, 14,
-                     11, 10, 44, 28, 8, 28, 28, 12, 12, 14,
+                     11, 12, 10, 10, 28, 8, 14,
+                     11, 10, 44, 28, 8, 12, 12, 14,
                      14, 14, 56])
     ws_match.freeze_panes = "A3"
     r = 1
     write_title(ws_match, r,
-        f"BANK - Matched: Book vs Statement  |  YES BANK  |  {BRS_DATE}", 26); r += 1
+        f"BANK - Matched: Book vs Statement  |  YES BANK  |  {BRS_DATE}", 22); r += 1
     write_hdr(ws_match, r,
         ["Method", "Name Match", "Score %", "Amt Match",
          "Book Date", "Book Txn", "Book Bill", "Book Chq", "Book Party",
-         "Book Dir", "Book Sender", "Book Recipient", "Book Amt (Rs)",
+         "Book Dir", "Book Amt (Rs)",
          "Bank Date", "Bank Chq", "Bank Description", "Bank Party",
-         "Bank Dir", "Bank Sender", "Bank Recipient",
-         "Debit (Rs)", "Credit (Rs)", "Bank Amt (Rs)",
+         "Bank Dir", "Debit (Rs)", "Credit (Rs)", "Bank Amt (Rs)",
          "Difference (Rs)", "Partial Payment", "Flags"])
 
     def _matched_name_flag(rec):
@@ -3731,6 +3792,9 @@ def process_gateway_files(
         if m:
             return m.group(1)
         return str(rec.get("bank_ref", "") or "")
+
+    def _matched_book_party(value):
+        return str(value or "").replace("INDIVI - ", "").strip()
 
     def _join_unique(values):
         out = []
@@ -3796,29 +3860,28 @@ def process_gateway_files(
         df = C_GREEN if abs(diff) < 1 and bank_amt else (C_AMBER if rec.get("verdict") == "DNC" else C_RED)
         ff = C_RED if rec.get("verdict") == "UNMATCHED" else (C_AMBER if rec.get("verdict") == "REVIEW" else C_GREY)
         bank_party = _matched_bank_party(rec)
+        book_party = _matched_book_party(rec.get("book_party", ""))
         vals = [
             rec.get("verdict", ""), name_flag, rec.get("name_score", 0), amt_flag,
             rec.get("book_date", ""), "Public Sale", rec.get("book_bill", ""), "511",
-            rec.get("book_party", ""), "INFLOW", rec.get("book_party", ""), "YES BANK",
-            book_amt,
+            book_party, "INFLOW", book_amt,
             rec.get("bank_date", ""), "", rec.get("bank_ref", ""), bank_party,
-            "INFLOW" if bank_amt else "", bank_party if bank_amt else "", "YES BANK" if bank_amt else "",
-            "", bank_amt if bank_amt else "", bank_amt if bank_amt else "",
+            "INFLOW" if bank_amt else "", "", bank_amt if bank_amt else "", bank_amt if bank_amt else "",
             diff if bank_amt else "", "", rec.get("verdict_reason", ""),
         ]
         fills = [C_GREY, nf, nf, af,
-                 C_GREY, C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN, C_GREEN, C_GREEN,
-                 C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN, C_GREEN, C_GREY, C_GREY, C_GREEN,
+                 C_GREY, C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN,
+                 C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREY, C_GREY, C_GREEN,
                  df, C_GREY, ff]
         for c, v in enumerate(vals, 1):
             sc(ws_match, r, c, v, bg=fills[c - 1],
-               h_align="right" if c in {13, 21, 22, 23, 24} else "left",
-               num_fmt=NF if c in {13, 21, 22, 23, 24} else None)
+               h_align="right" if c in {11, 17, 18, 19, 20} else "left",
+               num_fmt=NF if c in {11, 17, 18, 19, 20} else None)
 
     backdated_rows = _backdated_section_rows()
     if backdated_rows:
         r += 2
-        ws_match.merge_cells(start_row=r, start_column=1, end_row=r, end_column=26)
+        ws_match.merge_cells(start_row=r, start_column=1, end_row=r, end_column=22)
         sec = ws_match.cell(
             r, 1,
             f"Backdated / Previous BRS Clears ({len(backdated_rows)} transaction group(s))"
@@ -3827,7 +3890,7 @@ def process_gateway_files(
         sec.font = font(bold=True, color="1F3864")
         sec.border = _BR
         sec.alignment = align("center")
-        for col in range(2, 27):
+        for col in range(2, 23):
             ws_match.cell(r, col).fill = fill("D9EAF7")
             ws_match.cell(r, col).border = _BR
 
@@ -3844,21 +3907,19 @@ def process_gateway_files(
             vals = [
                 item["method"], name_flag, item["score"], amt_flag,
                 item["book_date"], item["book_txn"], item["book_bill"], "",
-                item["book_party"], "INFLOW", item["book_party"], "YES BANK",
-                book_amt,
+                _matched_book_party(item["book_party"]), "INFLOW", book_amt,
                 item["bank_date"], "", item["bank_ref"], item["bank_party"],
-                "INFLOW", item["bank_party"], "YES BANK",
-                "", bank_amt, bank_amt,
+                "INFLOW", "", bank_amt, bank_amt,
                 diff, "", item["flags"],
             ]
             fills = [C_GREY, nf, nf, af,
-                     C_GREY, C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN, C_GREEN, C_GREEN,
-                     C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN, C_GREEN, C_GREY, C_GREY, C_GREEN,
+                     C_GREY, C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREEN,
+                     C_GREY, C_GREY, C_GREY, nf, C_GREY, C_GREY, C_GREY, C_GREEN,
                      df, C_GREY, C_AMBER]
             for c, v in enumerate(vals, 1):
                 sc(ws_match, r, c, v, bg=fills[c - 1],
-                   h_align="right" if c in {13, 21, 22, 23, 24} else "left",
-                   num_fmt=NF if c in {13, 21, 22, 23, 24} else None)
+                   h_align="right" if c in {11, 17, 18, 19, 20} else "left",
+                   num_fmt=NF if c in {11, 17, 18, 19, 20} else None)
     # Summary totals
     r += 1
     matched_cnt   = sum(1 for rec in cheque_match_report if rec["verdict"] in ("MATCHED", "BILL_MATCH"))
@@ -3866,16 +3927,16 @@ def process_gateway_files(
     dnc_cnt       = sum(1 for rec in cheque_match_report if rec["verdict"] == "DNC")
     unmatched_cnt = sum(1 for rec in cheque_match_report if rec["verdict"] == "UNMATCHED")
     summary_bg = C_GREEN if unmatched_cnt == 0 and review_cnt == 0 else (C_AMBER if unmatched_cnt == 0 else C_RED)
-    ws_match.merge_cells(f"A{r}:Z{r}")
+    ws_match.merge_cells(f"A{r}:V{r}")
     c = ws_match.cell(r, 1,
         f"Total: {len(cheque_match_report)} entries  |  "
         f"Matched: {matched_cnt}  |  Review: {review_cnt}  |  "
         f"DNC (pending credit): {dnc_cnt}  |  Unmatched: {unmatched_cnt}")
     c.fill = fill(summary_bg); c.font = font(bold=True); c.border = _BR; c.alignment = align()
-    for col in range(2, 27):
+    for col in range(2, 23):
         ws_match.cell(r, col).fill = fill(summary_bg); ws_match.cell(r, col).border = _BR
 
-    # ─── Sheet 12: DNC ───────────────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 12: DNC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws11 = wb.create_sheet("Reco Items (DNC)")
     col_w(ws11, [14,10,36,14,38,16,42]); ws11.freeze_panes = "A3"
     r = 1
@@ -3888,12 +3949,12 @@ def process_gateway_files(
                                 item.get("remark","")], 1):
             sc(ws11, r, c, v, bg=bg, h_align="right" if c==6 else "left", num_fmt=NF if c==6 else None)
     
-    # ─── Sheet 13: CNB ───────────────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 13: CNB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws12 = wb.create_sheet("Bank Only (CNB)")
     col_w(ws12, [14,10,36,14,38,16,42]); ws12.freeze_panes = "A3"
     r = 1
-    write_title(ws12, r, f"Add: Credited in Bank but not in Book (CNB)  |  {BRS_DATE}", 7, bg=C_RED_H); r += 1
-    write_hdr(ws12, r, ["Date","Branch","UTR / Reference","Gateway","Party","Amount (Rs)","Remark"], bg=C_RED_H)
+    write_title(ws12, r, f"Add: Credited in Bank but not in Book (CNB)  |  {BRS_DATE}", 7, bg=C_PURPL_H); r += 1
+    write_hdr(ws12, r, ["Date","Branch","UTR / Reference","Gateway","Party","Amount (Rs)","Remark"], bg=C_PURPL_H)
     for item in cnb_all:
         r += 1; bg = C_CF if item.get("cf") else C_GREEN
         for c, v in enumerate([item["date"], item.get("branch","HOT"), item.get("utr",""),
@@ -3901,11 +3962,11 @@ def process_gateway_files(
                                 item.get("remark","")], 1):
             sc(ws12, r, c, v, bg=bg, h_align="right" if c==6 else "left", num_fmt=NF if c==6 else None)
     
-    # ─── Sheet 14: Gateway BRS Statement (formal 4-section) ──────────────────────
+    # â”€â”€â”€ Sheet 14: Gateway BRS Statement (formal 4-section) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws13 = wb.create_sheet("Gateway BRS Statement")
     # A:Date  B:Type  C:Bill No  D:Chq No  E:Book Report/Bank Statement
-    # F:Makez Extracted  G:Amount  H:Running Bal  I:Narration / Remarks
-    for cl, w in [("A",12),("B",14),("C",28),("D",10),("E",28),("F",28),("G",18),("H",18),("I",60)]:
+    # F:Makez Extracted  G:Amount  H:Narration / Remarks
+    for cl, w in [("A",12),("B",14),("C",28),("D",10),("E",28),("F",28),("G",18),("H",60)]:
         ws13.column_dimensions[cl].width = w
     ws13.freeze_panes = "A4"
     NF = "#,##0.00"
@@ -3918,27 +3979,27 @@ def process_gateway_files(
     BRS_ERR = "FFE0CC"
     
     def _t13(r13, text):
-        ws13.merge_cells(f"A{r13}:I{r13}")
+        ws13.merge_cells(f"A{r13}:H{r13}")
         c = ws13.cell(r13, 1, text)
         c.fill = fill(C_NAVY); c.font = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
         c.alignment = align("center"); c.border = _BR; ws13.row_dimensions[r13].height = 26
     
     def _sec13(r13, text, bg=C_BLUE):
-        ws13.merge_cells(f"A{r13}:I{r13}")
+        ws13.merge_cells(f"A{r13}:H{r13}")
         ws13.cell(r13, 1, text).fill = fill(bg)
         ws13.cell(r13, 1).font = Font(bold=True, color="FFFFFF", name="Calibri", size=10)
         ws13.cell(r13, 1).alignment = align(); ws13.cell(r13, 1).border = _BR
-        for col in range(2, 10): ws13.cell(r13, col).fill = fill(bg); ws13.cell(r13, col).border = _BR
+        for col in range(2, 9): ws13.cell(r13, col).fill = fill(bg); ws13.cell(r13, col).border = _BR
         ws13.row_dimensions[r13].height = 18
     
     def _item13(r13, desc, amount=None, running=None, bg=None, bold=False, remark=""):
-        """Simple merged label row — for balance/total rows (no column breakdown)."""
+        """Simple merged label row for balance/total rows."""
         ws13.merge_cells(f"A{r13}:F{r13}")
         sc(ws13, r13, 1, desc, bg=bg, bold=bold)
         for col in range(2, 7): sc(ws13, r13, col, None, bg=bg)
-        sc(ws13, r13, 7, amount,  bg=bg, bold=bold, h_align="right", num_fmt=NF)
-        sc(ws13, r13, 8, running, bg=bg, bold=bold, h_align="right", num_fmt=NF)
-        sc(ws13, r13, 9, remark, bg=bg); ws13.row_dimensions[r13].height = 16
+        sc(ws13, r13, 7, amount, bg=bg, bold=bold, h_align="right", num_fmt=NF)
+        sc(ws13, r13, 8, remark, bg=bg)
+        ws13.row_dimensions[r13].height = 16
 
     def _detail13(r13, date, txn_type, bill_no, chq_no, book_raw, bank_raw, makez, amount, running, remark, bg=None):
         """Expanded detail row with Book Report / Bank Statement / Makez Extracted columns."""
@@ -3949,16 +4010,15 @@ def process_gateway_files(
         sc(ws13, r13, 5, book_raw or bank_raw, bg=bg)
         sc(ws13, r13, 6, _clean_makez_extracted(makez), bg=bg)
         sc(ws13, r13, 7, amount,   bg=bg, h_align="right", num_fmt=NF)
-        sc(ws13, r13, 8, running,  bg=bg, h_align="right", num_fmt=NF)
-        sc(ws13, r13, 9, remark,  bg=bg)
+        sc(ws13, r13, 8, remark,  bg=bg)
         ws13.row_dimensions[r13].height = 16
 
     def _blank13(r13):
         ws13.row_dimensions[r13].height = 5; return r13 + 1
 
     def _col_header13(r13, evidence_header):
-        hdrs = ["Date","Type","Bill No","Chq No", evidence_header, "Makez Extracted",
-                "Amount (Rs)","Running Bal (Rs)","Narration / Remarks"]
+        hdrs = ["Date", "Type", "Bill No", "Chq No", evidence_header, "Makez Extracted",
+                "Amount (Rs)", "Narration / Remarks"]
         for col, h in enumerate(hdrs, 1):
             c = ws13.cell(row=r13, column=col, value=h)
             c.fill = fill(BRS_SUB); c.border = _BR
@@ -3967,15 +4027,38 @@ def process_gateway_files(
         ws13.row_dimensions[r13].height = 16
         return r13 + 1
 
-    def _running_row13(r13, running):
-        ws13.merge_cells(f"A{r13}:F{r13}")
-        sc(ws13, r13, 1, "", bg=BRS_SUB, bold=True)
-        for col in range(2, 7): sc(ws13, r13, col, None, bg=BRS_SUB)
-        sc(ws13, r13, 7, None, bg=BRS_SUB)
-        sc(ws13, r13, 8, running, bg=BRS_SUB, bold=True, h_align="right", num_fmt=NF)
-        sc(ws13, r13, 9, None, bg=BRS_SUB)
-        ws13.row_dimensions[r13].height = 17
+
+    def _required_header13(r13):
+        hdrs = ["DATE", "BRANCH", "BILL No./Order No.", "Cheque No./ PG Platform",
+                "Party name (Book & Bank)", "Makez Extracted", "Amount", "Narration / Remarks"]
+        for col, h in enumerate(hdrs, 1):
+            c = ws13.cell(row=r13, column=col, value=h)
+            c.fill = fill(BRS_SUB); c.border = _BR
+            c.font = Font(bold=True, color="000000", name="Calibri", size=10)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws13.row_dimensions[r13].height = 18
         return r13 + 1
+
+    def _required_detail13(r13, item, amount, bg=None, party=None, bill_no=None, platform=None, narration=None):
+        display_party = str(party if party is not None else item.get("party", "") or "").strip()
+        pg_platform = str(platform if platform is not None else (item.get("chq_no", "") or item.get("gateway", "")) or "").strip()
+        vals = [
+            item.get("date", ""),
+            item.get("branch", "HOT"),
+            bill_no if bill_no is not None else item.get("utr", ""),
+            pg_platform,
+            display_party,
+            _clean_makez_extracted(display_party),
+            amount,
+            _brs_remark(item) if narration is None else str(narration or "").strip(),
+        ]
+        for col, val in enumerate(vals, 1):
+            sc(ws13, r13, col, val, bg=bg,
+               h_align="right" if col == 7 else ("center" if col in {1, 2, 3, 4} else "left"),
+               num_fmt=NF if col == 7 else None)
+        ws13.row_dimensions[r13].height = 16
+    def _running_row13(r13, running):
+        return r13
 
     def _gateway_party_from_reason(reason):
         m = re.search(r"'([^']+)'", str(reason or ""))
@@ -3984,7 +4067,18 @@ def process_gateway_files(
     def _review_note(text):
         s = str(text or "").strip()
         return (s[:54] + " REVIEW ONLY") if len(s) > 54 else f"{s} REVIEW ONLY".strip()
-    
+
+    def _brs_remark(item, max_len=60):
+        """Return the narration for the BRS sheet narration column.
+
+        Only suppresses remarks that were auto-generated by the script itself
+        (flagged with _auto=True at creation time).  Any remark that originated
+        from an input file is always preserved unchanged.
+        """
+        if item.get("_auto"):
+            return ""
+        return str(item.get("remark", "") or "").strip()[:max_len]
+
     r13 = 1
     _t13(r13, "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD"); r13 += 1
     _t13(r13, "GATEWAY YES BANK :- 002281400006909"); r13 += 1
@@ -3993,13 +4087,12 @@ def process_gateway_files(
        bg=C_NAVY, bold=True, color="FFFFFF", size=11)
     for col in range(2, 7): sc(ws13, r13, col, None, bg=C_NAVY)
     sc(ws13, r13, 7, "AMOUNT IN RS", bg=C_NAVY, bold=True, color="FFFFFF", h_align="center")
-    sc(ws13, r13, 8, "AMOUNT IN RS", bg=C_NAVY, bold=True, color="FFFFFF", h_align="center")
-    sc(ws13, r13, 9, "", bg=C_NAVY)
+    sc(ws13, r13, 8, "", bg=C_NAVY)
     r13 += 1
     r13 = _blank13(r13)
     
     running13 = closing_bal
-    _item13(r13, "Closing Balance as per Company Books", None, running13, bg=C_GREEN, bold=True); r13 += 1
+    _item13(r13, "Closing Balance as per Company Books", running13, None, bg=C_GREEN, bold=True); r13 += 1
     r13 = _blank13(r13)
     
     _sec13(r13, "Add :  Cheques issued but not debited in Bank", bg=C_BLUE); r13 += 1
@@ -4015,11 +4108,11 @@ def process_gateway_files(
                 bill_no  = item.get("utr", ""),
                 chq_no   = item.get("chq_no", ""),
                 book_raw = item.get("party", ""),   # Book Report
-                bank_raw = "",                       # Bank Statement (blank — book-side item)
+                bank_raw = "",                       # Bank Statement (blank â€” book-side item)
                 makez    = item.get("party", ""),   # Makez Extracted
                 amount   = item["amount"],
                 running  = running13,
-                remark   = item.get("remark", "")[:60],
+                remark   = _brs_remark(item),
                 bg       = bg_r,
             )
             r13 += 1
@@ -4031,58 +4124,34 @@ def process_gateway_files(
     r13 = _blank13(r13)
     
     _sec13(r13, "Less :  Cheques deposited but not Credited in Bank", bg=C_BLUE); r13 += 1
-    r13 = _col_header13(r13, "Book Report")
+    r13 = _required_header13(r13)
     if dnc_all:
         for item in dnc_all:
             bg_r = BRS_CF if item.get("cf") else BRS_ITEM
             running13 -= item["amount"]
             gw_tag  = "[CF]" if item.get("cf") else f"[{item.get('gateway','')}]"
-            _detail13(r13,
-                date     = item["date"],
-                txn_type = gw_tag,
-                bill_no  = item.get("utr", ""),
-                chq_no   = item.get("chq_no", ""),
-                book_raw = item.get("party", ""),   # Book Report (book-side)
-                bank_raw = "",                       # Bank Statement (blank — not in bank)
-                makez    = item.get("party", ""),   # Makez Extracted
-                amount   = -item["amount"],
-                running  = running13,
-                remark   = item.get("remark", "")[:60],
-                bg       = bg_r,
-            )
+            _required_detail13(r13, item, -item["amount"], bg=bg_r)
             r13 += 1
     else:
         _item13(r13, "  Nil", None, running13); r13 += 1
     for rec in _review_mismatch_report:
         bg_r = BRS_ERR if rec.get("name_label") not in ("EXACT", "BILL_MATCH") else BRS_WARN
-        _detail13(r13,
-            date     = rec.get("book_date", "") or BRS_DATE,
-            txn_type = "[REVIEW]",
-            bill_no  = rec.get("book_bill", ""),
-            chq_no   = "511",
-            book_raw = rec.get("book_party", ""),
-            bank_raw = "",
-            makez    = rec.get("book_party", ""),
-            amount   = -float(rec.get("book_amount", 0.0) or 0.0),
-            running  = None,
-            remark   = _review_note(rec.get("verdict_reason", "")),
-            bg       = bg_r,
+        _required_detail13(
+            r13,
+            {"date": rec.get("book_date", "") or BRS_DATE, "branch": "HOT", "utr": rec.get("book_bill", ""), "chq_no": "511"},
+            -float(rec.get("book_amount", 0.0) or 0.0),
+            bg=bg_r,
+            party=rec.get("book_party", ""),
         )
         r13 += 1
     for gw_name, brow in _gw_disc_items_for_report:
         label = f"{gw_name} settlement"
-        _detail13(r13,
-            date     = BRS_DATE,
-            txn_type = "[REVIEW]",
-            bill_no  = f"GW-DIFF-DNC-{str(brow.get('UTR', '')).strip()}",
-            chq_no   = "",
-            book_raw = label,
-            bank_raw = "",
-            makez    = label,
-            amount   = -float(brow.get("Net", 0.0) or 0.0),
-            running  = None,
-            remark   = "Amount discrepancy retained for review REVIEW ONLY",
-            bg       = BRS_WARN,
+        _required_detail13(
+            r13,
+            {"date": BRS_DATE, "branch": "HOT", "utr": f"GW-DIFF-DNC-{str(brow.get('UTR', '')).strip()}", "gateway": gw_name},
+            -float(brow.get("Net", 0.0) or 0.0),
+            bg=BRS_WARN,
+            party=label,
         )
         r13 += 1
     _item13(r13, f"Total DNC -- {len(dnc_all)} items", -total_dnc, None, bg=BRS_SUB, bold=True); r13 += 1
@@ -4101,12 +4170,12 @@ def process_gateway_files(
                 txn_type = gw_tag,
                 bill_no  = item.get("utr", ""),
                 chq_no   = item.get("chq_no", ""),
-                book_raw = "",                       # Book Report (blank — not in book)
+                book_raw = "",                       # Book Report (blank â€” not in book)
                 bank_raw = item.get("party", ""),   # Bank Statement (bank-side)
                 makez    = item.get("party", ""),   # Makez Extracted
                 amount   = -item["amount"],
                 running  = running13,
-                remark   = item.get("remark", "")[:60],
+                remark   = _brs_remark(item),
                 bg       = bg_r,
             )
             r13 += 1
@@ -4116,69 +4185,45 @@ def process_gateway_files(
     r13 = _running_row13(r13, running13)
     r13 = _blank13(r13)
     
-    _sec13(r13, "Add :  Credited in Bank but not debited in Our Book", bg=C_BLUE); r13 += 1
-    r13 = _col_header13(r13, "Bank Statement")
+    _sec13(r13, "Add :  Credited in pass book but not debited in Our book", bg=C_BLUE); r13 += 1
+    r13 = _required_header13(r13)
     if cnb_all:
         for item in cnb_all:
             bg_r = BRS_CF if item.get("cf") else BRS_ITEM
             running13 += item["amount"]
             ref_p  = item.get("utr","") if str(item.get("utr","")) not in ("nan","") else ""
             gw_tag = "[CF]" if item.get("cf") else f"[{item.get('gateway','')}]"
-            _detail13(r13,
-                date     = item["date"],
-                txn_type = gw_tag,
-                bill_no  = ref_p,
-                chq_no   = item.get("chq_no", ""),
-                book_raw = "",                       # Book Report (blank — not in book)
-                bank_raw = item.get("party", ""),   # Bank Statement (bank-side)
-                makez    = item.get("party", ""),   # Makez Extracted
-                amount   = item["amount"],
-                running  = running13,
-                remark   = item.get("remark", "")[:60],
-                bg       = bg_r,
-            )
+            _required_detail13(r13, item, item["amount"], bg=bg_r, bill_no=ref_p)
             r13 += 1
     else:
         _item13(r13, "  Nil", None, running13); r13 += 1
     for rec in _review_mismatch_report:
         bg_r = BRS_ERR if rec.get("name_label") not in ("EXACT", "BILL_MATCH") else BRS_WARN
         gw_party = _gateway_party_from_reason(rec.get("verdict_reason", "")) or str(rec.get("bank_ref", ""))
-        _detail13(r13,
-            date     = rec.get("bank_date", "") or BRS_DATE,
-            txn_type = "[REVIEW]",
-            bill_no  = rec.get("bank_ref", ""),
-            chq_no   = "",
-            book_raw = "",
-            bank_raw = gw_party,
-            makez    = gw_party,
-            amount   = float(rec.get("bank_amount", 0.0) or 0.0),
-            running  = None,
-            remark   = _review_note(rec.get("verdict_reason", "")),
-            bg       = bg_r,
+        _required_detail13(
+            r13,
+            {"date": rec.get("bank_date", "") or BRS_DATE, "branch": "GATEWAY", "utr": rec.get("bank_ref", ""), "gateway": "REVIEW"},
+            float(rec.get("bank_amount", 0.0) or 0.0),
+            bg=bg_r,
+            party=gw_party,
         )
         r13 += 1
     for gw_name, brow in _gw_disc_items_for_report:
         label = f"{gw_name} bank credit"
-        _detail13(r13,
-            date     = BRS_DATE,
-            txn_type = "[REVIEW]",
-            bill_no  = f"GW-DIFF-CNB-{str(brow.get('UTR', '')).strip()}",
-            chq_no   = "",
-            book_raw = "",
-            bank_raw = label,
-            makez    = label,
-            amount   = float(brow.get("Bank_Credit", 0.0) or 0.0),
-            running  = None,
-            remark   = "Amount discrepancy retained for review REVIEW ONLY",
-            bg       = BRS_WARN,
+        _required_detail13(
+            r13,
+            {"date": BRS_DATE, "branch": "GATEWAY", "utr": f"GW-DIFF-CNB-{str(brow.get('UTR', '')).strip()}", "gateway": gw_name},
+            float(brow.get("Bank_Credit", 0.0) or 0.0),
+            bg=BRS_WARN,
+            party=label,
         )
         r13 += 1
     _item13(r13, f"Total CNB -- {len(cnb_all)} items", total_cnb, None, bg=BRS_SUB, bold=True); r13 += 1
     r13 = _running_row13(r13, running13)
     r13 = _blank13(r13)
 
-    # ── Amount Discrepancy Section ─────────────────────────────────────────────
-    # Show gateway settlements where GW Net ≠ Bank Credit (amount mismatches)
+    # â”€â”€ Amount Discrepancy Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Show gateway settlements where GW Net â‰  Bank Credit (amount mismatches)
     _disc_items = [
         brow for brs_list in [payu_brs, od_brs, cf_brs, eb_brs]
         for brow in brs_list
@@ -4191,7 +4236,7 @@ def process_gateway_files(
     ] for brow in brs_list}
 
     if False and _disc_items:
-        _sec13(r13, f"Amount Discrepancies — Gateway Net ≠ Bank Credit  ({len(_disc_items)} items)", bg="C55A11"); r13 += 1
+        _sec13(r13, f"Amount Discrepancies â€” Gateway Net â‰  Bank Credit  ({len(_disc_items)} items)", bg="C55A11"); r13 += 1
         # Sub-header for discrepancy rows
         ws13.merge_cells(f"A{r13}:G{r13}")
         ws13.cell(r13, 1, "Gateway | UTR | Description").fill = fill("FCE4D6")
@@ -4228,10 +4273,10 @@ def process_gateway_files(
         ws13.row_dimensions[r13].height = 16; r13 += 1
         r13 = _blank13(r13)
     if False:
-        _sec13(r13, "✓  No Amount Discrepancies — All Gateway Settlements Match Bank Credits", bg="1A7C4A"); r13 += 1
+        _sec13(r13, "âœ“  No Amount Discrepancies â€” All Gateway Settlements Match Bank Credits", bg="1A7C4A"); r13 += 1
         r13 = _blank13(r13)
 
-    # ── Name Mismatch Section ──────────────────────────────────────────────────
+    # â”€â”€ Name Mismatch Section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     # Show cheque deposits where book party name does NOT match gateway/bank name
     _name_mismatch_items = [
         rec for rec in cheque_match_report
@@ -4240,10 +4285,10 @@ def process_gateway_files(
         and rec.get("bank_ref", "")
     ]
     if False and _name_mismatch_items:
-        _sec13(r13, f"Name Mismatches — Book Party ≠ Gateway/Bank Name  ({len(_name_mismatch_items)} items)", bg="7B3F00"); r13 += 1
+        _sec13(r13, f"Name Mismatches â€” Book Party â‰  Gateway/Bank Name  ({len(_name_mismatch_items)} items)", bg="7B3F00"); r13 += 1
         # Sub-header
         ws13.merge_cells(f"A{r13}:G{r13}")
-        ws13.cell(r13, 1, "Bill No. | Book Party  →  Gateway Party").fill = fill("FCE4D6")
+        ws13.cell(r13, 1, "Bill No. | Book Party  â†’  Gateway Party").fill = fill("FCE4D6")
         ws13.cell(r13, 1).font = Font(bold=True, name="Calibri", size=9)
         ws13.cell(r13, 1).border = _BR
         ws13.cell(r13, 1).alignment = align()
@@ -4265,7 +4310,7 @@ def process_gateway_files(
             if _gp_m:
                 gw_party = _gp_m.group(1)
             lbl = (f"{rec['book_bill']}  |  {rec['book_party']}"
-                   + (f"  →  {gw_party}" if gw_party else ""))
+                   + (f"  â†’  {gw_party}" if gw_party else ""))
             ws13.merge_cells(f"A{r13}:G{r13}")
             sc(ws13, r13, 1, lbl[:100], bg=bg_mm)
             for col in range(2, 8): sc(ws13, r13, col, None, bg=bg_mm)
@@ -4276,19 +4321,18 @@ def process_gateway_files(
 
         r13 = _blank13(r13)
     if False:
-        _sec13(r13, "✓  No Name Mismatches — All Credited Entries Match Gateway Names", bg="1A7C4A"); r13 += 1
+        _sec13(r13, "âœ“  No Name Mismatches â€” All Credited Entries Match Gateway Names", bg="1A7C4A"); r13 += 1
         r13 = _blank13(r13)
 
     bal_bg = C_GREEN if reconciled else C_RED
-    _item13(r13, "Closing Balance as per Bank",
-            None, bank_bal, bg=bal_bg, bold=True); r13 += 1
+    _item13(r13, "Closing Balance as per Bank", bank_bal, None, bg=bal_bg, bold=True); r13 += 1
     r13 = _blank13(r13)
 
     difference13 = round(bank_bal - running13, 2)
     diff_bg = C_GREEN if abs(difference13) <= 1 else C_RED
     diff_label = "Difference  -  Fully Reconciled" if abs(difference13) <= 1 else "Difference  -  Investigate"
     diff_value = "-" if abs(difference13) <= 1 else difference13
-    _item13(r13, diff_label, None, diff_value, bg=diff_bg, bold=True); r13 += 1
+    _item13(r13, diff_label, diff_value, None, bg=diff_bg, bold=True); r13 += 1
     r13 = _blank13(r13)
 
     if False and (_disc_items or _name_mismatch_items):
@@ -4350,7 +4394,7 @@ def process_gateway_files(
         r13 = _blank13(r13)
     
     for gw in []:
-        ws13.merge_cells(f"A{r13}:I{r13}")
+        ws13.merge_cells(f"A{r13}:H{r13}")
         gd = gw["gw_net"] - gw["bank_total"]
         ws13.cell(r13, 1,
             f"{gw['name']}:  Gross=Rs {gw['gross']:,.2f}  Fees=Rs {gw['fees']:,.2f}  "
@@ -4358,7 +4402,7 @@ def process_gateway_files(
             f"Bank=Rs {gw['bank_total']:,.2f}  Diff=Rs {gd:,.2f}"
         ).font = Font(name="Calibri", size=9, color="595959")
         ws13.cell(r13, 1).alignment = align(); ws13.cell(r13, 1).border = no_border(); r13 += 1
-    ws13.merge_cells(f"A{r13}:I{r13}")
+    ws13.merge_cells(f"A{r13}:H{r13}")
     ws13.cell(r13, 1,
         "CF=Carried Forward | Add1=Issued Not Debited | DNC=Deposited Not Credited | "
         "CNB=Credited Not Booked | Less2=Bank debit not in book | "
@@ -4366,48 +4410,7 @@ def process_gateway_files(
     ).font = Font(name="Calibri", size=8, italic=True, color="595959")
     ws13.cell(r13, 1).alignment = align(); ws13.cell(r13, 1).border = no_border()
     
-    # ─── Sheet 15: Transaction Cost Summary ──────────────────────────────────────
-    ws14 = wb.create_sheet("Gateway Txn Costs")
-    col_w(ws14, [22, 18, 16, 16, 16, 18, 16, 18, 40]); ws14.freeze_panes = "A3"
-    r = 1
-    write_title(ws14, r, f"Gateway Transaction Cost Summary  |  {BRS_DATE}", 9); r += 1
-    write_hdr(ws14, r, ["Gateway","UTR / Ref","Gross (Rs)","Proc Fees (Rs)","Svc Tax / GST (Rs)",
-                        "Total Fees (Rs)","Net (Rs)","Bank Credit (Rs)","Status / Notes"])
-    COST_COLORS = {"PayU-Regular": C_LBLUE, "PayU-OnDemand": C_TEAL,
-                   "CashFree": C_CF, "EaseBuzz": C_PURPL}
-    for gw_name, brs_list in [("PayU-Regular", payu_brs), ("PayU-OnDemand", od_brs),
-                                ("CashFree", cf_brs), ("EaseBuzz", eb_brs)]:
-        if not brs_list: continue
-        row_bg = COST_COLORS.get(gw_name, C_GREY)
-        for brow in brs_list:
-            r += 1
-            status_note = brow["Status"]
-            for c, v in enumerate([gw_name, brow["UTR"],
-                                    brow["Gross"], brow["Fees"], brow["Tax"],
-                                    brow["FeesTotal"], brow["Net"],
-                                    brow["Bank_Credit"], status_note], 1):
-                bg = C_GREEN if brow["Color"]=="GREEN" else C_AMBER if brow["Color"]=="AMBER" else C_RED
-                if c in [1, 2]: bg = row_bg
-                sc(ws14, r, c, v, bg=bg, h_align="right" if c in range(3,9) else "left",
-                   num_fmt=NF if c in range(3,9) else None)
-    r += 1
-    totals = dict(
-        Gross = sum(brow["Gross"] for brs in [payu_brs, od_brs, cf_brs, eb_brs] for brow in brs),
-        Fees  = sum(brow["Fees"]  for brs in [payu_brs, od_brs, cf_brs, eb_brs] for brow in brs),
-        Tax   = sum(brow["Tax"]   for brs in [payu_brs, od_brs, cf_brs, eb_brs] for brow in brs),
-        FT    = sum(brow["FeesTotal"] for brs in [payu_brs, od_brs, cf_brs, eb_brs] for brow in brs),
-        Net   = total_gw_all,
-        Bank  = total_bank_all,
-    )
-    for c in range(1, 10):
-        v_map = {1:"TOTAL", 3:totals["Gross"], 4:totals["Fees"], 5:totals["Tax"],
-                 6:totals["FT"], 7:totals["Net"], 8:totals["Bank"],
-                 9:f"Diff=Rs {totals['Net']-totals['Bank']:,.2f}"}
-        sc(ws14, r, c, val=v_map.get(c), bg=C_GREY, bold=True,
-           h_align="right" if c in range(3,9) else "left",
-           num_fmt=NF if c in range(3,9) else None)
-    
-    # ─── Sheet 17: Summary ───────────────────────────────────────────────────────
+    # â”€â”€â”€ Sheet 17: Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ws15 = wb.create_sheet("Summary")
     col_w(ws15, [52, 36, 46]); ws15.freeze_panes = "A3"
     r = 1
