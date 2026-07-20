@@ -2836,7 +2836,8 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
             cleared_log.append({**item, "section": "issued_not_debited",
                                  "status": "CLEARED (cross-matched with debited_not_book)"})
             continue
-        if item["chq_no"]:
+        item_chq = _norm_chq(item.get("chq_no", ""))
+        if item_chq and item_chq not in GENERIC_CHQ:
             chq_groups[item["chq_no"]].append(item)
         else:
             no_chq_items.append(item)
@@ -7368,6 +7369,45 @@ def build_brs_sheet(wb, book_only, stmt_only,
             })
         return rows
 
+    def _matched_chq_review_bank_rows(bank_direction):
+        """Bank-side mirror of matched cheque-number differences.
+        Display only: these rows are already reconciled and must not affect totals.
+        """
+        if matched_df is None or matched_df.empty:
+            return []
+        flags = matched_df.get("Flags", pd.Series("", index=matched_df.index)).astype(str)
+        review_df = matched_df[
+            flags.str.contains("Cheque no differs", case=False, na=False) &
+            (matched_df.get("Bank Direction", pd.Series("", index=matched_df.index)).astype(str).str.upper() == bank_direction)
+        ]
+        rows = []
+        seen = set()
+        for _, mr in review_df.iterrows():
+            key = (
+                str(mr.get("Bank Date", "")).strip(),
+                str(mr.get("Book Chq", "")).strip(),
+                str(mr.get("Bank Chq", "")).strip(),
+                str(mr.get("Bank Description", "")).strip(),
+                round(float(mr.get("Bank Amt (Rs)", 0) or 0), 2),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            note = next(
+                (seg for seg in str(mr.get("Flags", "")).split(" | ") if "Cheque no differs" in seg),
+                "Cheque no differs"
+            )
+            rows.append({
+                "Date": mr.get("Bank Date", ""),
+                "Chq No": mr.get("Bank Chq", ""),
+                "Description": mr.get("Bank Description", ""),
+                "Party": mr.get("Bank Party", ""),
+                "Direction": mr.get("Bank Direction", ""),
+                "Bank Amt (Rs)": float(mr.get("Bank Amt (Rs)", 0) or 0),
+                "Narration": note,
+            })
+        return rows
+
     def _is_hot_or_internal(row_data):
         """Returns True if this book_only row is an internal HOT transfer that
         must NOT appear in its BRS section:
@@ -7684,7 +7724,8 @@ def build_brs_sheet(wb, book_only, stmt_only,
     section_row("Less :  Debited in Bank but not credited in Our Book")
     col_header_row("bank")
     total_debited = 0.0
-    if debited_not_book.empty:
+    _debited_chq_review = _matched_chq_review_bank_rows("OUTFLOW")
+    if debited_not_book.empty and not _debited_chq_review:
         nil_row()
     else:
         for _, row_data in debited_not_book.iterrows():
@@ -7714,6 +7755,14 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      is_rejected=rejected)
             if not _is_nullified:
                 total_debited += amt
+        for row_data in _debited_chq_review:
+            _desc = str(row_data.get("Description", ""))
+            _party = str(row_data.get("Party", "")) or _desc
+            item_row(row_data.get("Date", ""), "", "", row_data.get("Chq No", ""),
+                     _party, float(row_data.get("Bank Amt (Rs)", 0) or 0),
+                     row_data.get("Narration", ""), is_cf=False,
+                     book_raw="", bank_raw=_desc, is_rejected=False)
+            # Display only - already reconciled; do not add to total_debited.
     subtotal_row(total_debited)
     running -= total_debited
     running_row(running)
@@ -7770,7 +7819,8 @@ def build_brs_sheet(wb, book_only, stmt_only,
                     "_display_chq":    str(_sr.get("Chq No", _cl.get("chq_no", ""))),
                     "_display_amt":    float(_sr.get("Bank Amt (Rs)", _cl.get("amount", 0)) or 0),
                 })
-    if credited_not_book.empty and not _backdated_cnb:
+    _credited_chq_review = _matched_chq_review_bank_rows("INFLOW")
+    if credited_not_book.empty and not _backdated_cnb and not _credited_chq_review:
         nil_row()
     else:
         for _, row_data in credited_not_book.iterrows():
@@ -7844,6 +7894,14 @@ def build_brs_sheet(wb, book_only, stmt_only,
             if not bool(row_data.get("_brs_residual_exclude", False)) and not _is_nullified:
                 total_credited += _display_amt
         # Show cleared CF bank credits - display only, not counted in balance
+        for row_data in _credited_chq_review:
+            _desc = str(row_data.get("Description", ""))
+            _party = str(row_data.get("Party", "")) or _desc
+            item_row(row_data.get("Date", ""), "", "", row_data.get("Chq No", ""),
+                     _party, float(row_data.get("Bank Amt (Rs)", 0) or 0),
+                     row_data.get("Narration", ""), is_cf=False,
+                     book_raw="", bank_raw=_desc, is_rejected=False)
+            # Display only - already reconciled; do not add to total_credited.
         for _cl in _backdated_cnb:
             _amt   = float(_cl.get("_display_amt",  _cl.get("amount", 0)) or 0)
             _party = str(_cl.get("_display_party",  _cl.get("party", "")))

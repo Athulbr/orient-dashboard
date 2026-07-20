@@ -1,6 +1,7 @@
 
 import re
 import sys
+from copy import copy
 from pathlib import Path
 from datetime import datetime
 from itertools import combinations
@@ -1801,6 +1802,55 @@ def process_qr_files(
         return key or str(party or "").upper().strip()
 
     AMT_DIFF_MAX = 5_000  # flag differences up to Rs 5,000 only; larger gaps are separate transactions
+    def _same_branch_close_date(book_row, bank_row):
+        book_date = book_row["date"]
+        bank_date = _bank_credit_date(bank_row)
+        return (
+            book_row["branch"] == bank_row["branch_code"]
+            and pd.notna(book_date)
+            and pd.notna(bank_date)
+            and abs((bank_date - book_date).days) <= 1
+        )
+
+    def _has_strong_single_book_claim(bank_row, split_idxs):
+        split_idx_set = set(split_idxs)
+        bank_amt = float(bank_row["amount(rs.)"])
+        bank_name = bank_row[name_col]
+        for other_bi, other_bk in book_df.iterrows():
+            if other_bi in matched_book or other_bi in split_idx_set:
+                continue
+            if other_bk.get("book_source", "public_sale") != "public_sale":
+                continue
+            if abs(float(other_bk["amount"]) - bank_amt) > 0.005:
+                continue
+            if not _same_branch_close_date(other_bk, bank_row):
+                continue
+            if name_sim(other_bk["party"], bank_name) >= FUZZY_THRESH:
+                return True
+        return False
+
+    def _split_parts_have_strong_individual_claims(split_idxs, combined_bank_idx):
+        for bi in split_idxs:
+            bk = book_df.loc[bi]
+            part_amt = float(bk["amount"])
+            found = False
+            for other_bki, other_bank in bank_pool.iterrows():
+                if (
+                    other_bki == combined_bank_idx
+                    or other_bki in matched_bank
+                    or other_bki in reserved_prev_dnc_bank
+                ):
+                    continue
+                if abs(float(other_bank["amount(rs.)"]) - part_amt) > 0.005:
+                    continue
+                if not _same_branch_close_date(bk, other_bank):
+                    continue
+                if name_sim(bk["party"], other_bank[name_col]) >= FUZZY_THRESH:
+                    found = True
+                    break
+            if not found:
+                return False
+        return True
 
     # Pass 0B: Same bill split in the book cleared by one bank credit.
     # Example pattern: two book rows under the same bill (29170 + 1) and one
@@ -1844,6 +1894,15 @@ def process_qr_files(
             if max(scores) < FUZZY_ACCEPT:
                 continue
             avg_sc = sum(scores) // len(scores)
+            if avg_sc < FUZZY_THRESH and (
+                _has_strong_single_book_claim(brow, idxs)
+                or _split_parts_have_strong_individual_claims(idxs, bki)
+            ):
+                print(
+                    f"    SKIP SAME-BILL SPLIT: stronger exact-name claim exists for "
+                    f"{bank_br}/{bank_name}/{int(bank_amt)}"
+                )
+                continue
             first_bi = idxs[0]
             bill = str(book_df.at[first_bi, "bill_no"])
             party = str(book_df.at[first_bi, "party"])
@@ -4819,6 +4878,72 @@ def process_qr_files(
                     num_fmt="#,##0" if c_idx == 11 else None,
                 )
 
+    # Add Matched-sheet transactions in the Cheque Deposit display format.
+    # This is display-only: it does not affect matching or BRS arithmetic.
+    for _src in ws3.iter_rows(min_row=3, values_only=True):
+        _method = _src[0] if len(_src) > 0 else ""
+        _book_date = _src[4] if len(_src) > 4 else ""
+        _book_branch = _src[5] if len(_src) > 5 else ""
+        _book_bill = _src[7] if len(_src) > 7 else ""
+        _book_party = _src[9] if len(_src) > 9 else ""
+        if not _method or not _book_date or not _book_bill or not _book_party:
+            continue
+
+        _name_match = _src[1] if len(_src) > 1 else ""
+        _book_bank = _src[6] if len(_src) > 6 and _src[6] else QR_ACCOUNT_CODE
+        _book_chq = _src[8] if len(_src) > 8 else 511
+        _book_amt = _src[10] if len(_src) > 10 else None
+        _bank_date = _src[11] if len(_src) > 11 else ""
+        _bank_rrn = _src[16] if len(_src) > 16 else ""
+        _pay_type = _src[17] if len(_src) > 17 else ""
+        _diff = _src[18] if len(_src) > 18 and _src[18] not in (None, "") else None
+        _flags = str(_src[19] if len(_src) > 19 and _src[19] else "").strip()
+
+        if str(_method).startswith("Receipt-ZEROISE"):
+            _narration = _flags or "RECEIPTS TRANSACTION - display only"
+        elif _bank_date:
+            if _name_match == "Low":
+                _narration = f"LOW NAME MATCH - CREDITED AS ON {_bank_date}"
+            elif _name_match == "Partial":
+                _narration = f"PARTIAL NAME MATCH - CREDITED AS ON {_bank_date}"
+            else:
+                _narration = f"CREDITED AS ON {_bank_date}"
+            if _flags:
+                _narration = f"{_narration} | {_flags}"
+        else:
+            _narration = _flags
+
+        _diff_display = None
+        if isinstance(_diff, (int, float)) and abs(_diff) > 0.005:
+            _diff_display = _diff
+
+        r += 1
+        for c, v in enumerate(
+            [
+                _book_date,
+                _book_branch,
+                _book_bank,
+                _book_bill,
+                _book_chq,
+                _bank_rrn,
+                _pay_type,
+                _book_party,
+                _book_amt,
+                _diff_display,
+                _narration,
+            ],
+            1,
+        ):
+            diff_bg = C_RED if (c == 10 and _diff_display is not None) else None
+            set_cell(
+                ws,
+                r,
+                c,
+                v,
+                bg=diff_bg,
+                h_align="right" if c in (9, 10) else "left",
+                num_fmt="#,##0.00" if c == 10 else ("#,##0" if c == 9 else None),
+            )
     ws4 = wb.create_sheet("Reco Items (Book Only)")
     col_widths(ws4, [14, 8, 8, 16, 10, 38, 14, 36])
     ws4.freeze_panes = "A3"
@@ -5416,203 +5541,8 @@ def process_qr_files(
     _brs_balance("Difference  (should be 0 when reconciled)", bank_bal, bg=_bal_bg)
     _brs_blank()
 
-    #  Matched Transactions with Discrepancies
-    # Surfaces any matched pair where name score is below the fixed
-    # party-confirmation margin or amounts differ.
-    _disc_rows = [
-        m
-        for m in matched_rows
-        if m["Score%"] < PARTY_CONFIRMATION_THRESHOLD or m["Diff"] != 0
-    ]
-    for _pair in prev_dnc_current_cnb_display_matches:
-        _dnc = _pair["dnc"]
-        _cnb = _pair["cnb"]
-        _sc = _pair.get("score", 0) or 0
-        _diff = _pair.get("amt_diff", 0) or 0
-        if _sc >= PARTY_CONFIRMATION_THRESHOLD and abs(_diff) < 1:
-            continue
-        _cnb_parts = _cnb.get("parts", []) or []
-        if _cnb_parts:
-            _bank_date = " / ".join(
-                dict.fromkeys(
-                    str(p.get("settlement_date", "") or p.get("date", ""))
-                    for p in _cnb_parts
-                    if p.get("settlement_date", "") or p.get("date", "")
-                )
-            )
-            _bank_party = " / ".join(
-                str(p.get("party", "")).strip()
-                for p in _cnb_parts
-                if str(p.get("party", "")).strip()
-            )
-            _bank_amt = sum(float(p.get("amount", 0) or 0) for p in _cnb_parts)
-        else:
-            _bank_date = _cnb.get("settlement_date", "") or _cnb.get("date", "")
-            _bank_party = _cnb.get("party", "")
-            _bank_amt = _cnb.get("amount", 0)
-        _disc_rows.append(
-            {
-                "Method": "CF-Pair-Clear" if _pair.get("pair_cleared") else "CF-DNC-Clear",
-                "Name Match": (
-                    "Match"
-                    if _sc >= FUZZY_THRESH
-                    else "Partial" if _sc >= FUZZY_ACCEPT else "Low"
-                ),
-                "Score%": _sc,
-                "Book Date": _dnc.get("date", ""),
-                "Book Branch": _dnc.get("branch", ""),
-                "Book Bill No": _dnc.get("ref", ""),
-                "Book Party": _dnc.get("party", ""),
-                "Book Amt": _dnc.get("amount", 0),
-                "Bank Date": _bank_date,
-                "Bank Payer": _bank_party,
-                "Bank Amt": _bank_amt,
-                "Diff": _diff,
-                "Flags": (
-                    f"AMOUNT DIFFERENCE Rs {_diff:+,.2f} - previous BRS DNC/CNB clear"
-                    if abs(_diff) >= 1
-                    else "Previous BRS carry-forward clear requires review"
-                ),
-            }
-        )
-
-    if _disc_rows:
-        _n_low = sum(1 for m in _disc_rows if m["Name Match"] == "Low")
-        _n_partial = sum(1 for m in _disc_rows if m["Name Match"] == "Partial")
-        _n_amt_diff = sum(1 for m in _disc_rows if m["Diff"] != 0)
-        _type_parts = []
-        if _n_low:
-            _type_parts.append(f"{_n_low} low name match{'es' if _n_low > 1 else ''}")
-        if _n_partial:
-            _type_parts.append(
-                f"{_n_partial} partial name match{'es' if _n_partial > 1 else ''}"
-            )
-        if _n_amt_diff:
-            _type_parts.append(
-                f"{_n_amt_diff} amount difference{'s' if _n_amt_diff > 1 else ''}"
-            )
-        _type_summary = ", ".join(_type_parts)
-
-        # Section banner  dark red, white text
-        _SEC_W = fill("C00000")
-        _brs_merge(
-            r7,
-            f"Matched Transactions with Discrepancies  Requires Verification  "
-            f"({len(_disc_rows)} items: {_type_summary})",
-            _SEC_W,
-            Font(bold=True, color="FFFFFF", name="Calibri", size=10),
-        )
-        ws7.row_dimensions[r7].height = 20
-        r7 += 1
-
-        # Column header row for discrepancy detail
-        _disc_hdrs = [
-            "Book Date",
-            "Book Branch",
-            "Book Bill No",
-            "Book Party",
-            "Book Amt (Rs)",
-            "Bank Date",
-            "Bank Party",
-            "Bank Amt (Rs)",
-            "Flag / Reason",
-        ]
-        for _ci, _h in enumerate(_disc_hdrs, 1):
-            _c = ws7.cell(r7, _ci, _h)
-            _c.fill = fill("DCE6F1")
-            _c.font = font(bold=True)
-            _c.border = _bdr
-            _c.alignment = Alignment(horizontal="center", vertical="center")
-        ws7.row_dimensions[r7].height = 16
-        r7 += 1
-
-        # One detail row per discrepant match
-        for _m in _disc_rows:
-            _nm = _m["Name Match"]
-            _diff = _m["Diff"]
-            _sc = _m["Score%"]
-
-            # Row colour: red=party confirmation, peach=name note, amber=amt-only diff
-            _row_bg = NO_FILL
-
-            _flag_parts = []
-            if _nm == "Low":
-                _flag_parts.append(
-                    f"LOW NAME MATCH ({_sc}%): "
-                    f"Book='{_m['Book Party']}' vs Bank='{_m['Bank Payer']}'  manual check required"
-                )
-            elif _nm == "Partial":
-                _flag_parts.append(
-                    f"PARTIAL NAME MATCH ({_sc}%): "
-                    f"Book='{_m['Book Party']}' vs Bank='{_m['Bank Payer']}'  confirm same party"
-                )
-            if _diff != 0:
-                _flag_parts.append(
-                    f"AMOUNT DIFFERENCE: Rs{_diff:+,.2f}  "
-                    f"Book Rs{_m['Book Amt']:,.2f} vs Bank Rs{_m['Bank Amt']:,.2f}"
-                )
-            if _m.get("Flags"):
-                for _seg in _m["Flags"].split(" | "):
-                    if _seg and _seg not in " | ".join(_flag_parts):
-                        _flag_parts.append(_seg)
-            _flag_text = " | ".join(dict.fromkeys(filter(None, _flag_parts)))
-
-            _vals = [
-                _m["Book Date"],
-                _m["Book Branch"],
-                _m["Book Bill No"],
-                _m["Book Party"],
-                _m["Book Amt"],
-                _m["Bank Date"],
-                _m["Bank Payer"],
-                _m["Bank Amt"],
-                _flag_text,
-            ]
-            for _ci, _v in enumerate(_vals, 1):
-                _cell = ws7.cell(r7, _ci, _v)
-                _cell.fill = _row_bg
-                _cell.border = _bdr
-                _cell.font = font(bold=False)
-                _cell.alignment = Alignment(
-                    horizontal="right" if _ci in (5, 8) else "left",
-                    vertical="center",
-                    wrap_text=True,
-                )
-                if _ci in (5, 8) and isinstance(_v, (int, float)):
-                    _cell.number_format = "#,##0.00"
-            # Fill remaining columns 10 & 11
-            for _ci in (10, 11):
-                _cell = ws7.cell(r7, _ci, "")
-                _cell.fill = _row_bg
-                _cell.border = _bdr
-            ws7.row_dimensions[r7].height = 16
-            r7 += 1
-
-        # Legend row
-        ws7.merge_cells(f"A{r7}:K{r7}")
-        _leg = ws7.cell(
-            r7,
-            1,
-            " Red = Low Name Match (<60%)  manual verification required   "
-            "[ORANGE] Orange = Partial Name Match (60-89%)  confirm same party   "
-            "[YELLOW] Yellow = Amount difference  review and confirm",
-        )
-        _leg.fill = NO_FILL
-        _leg.font = Font(name="Calibri", size=8, italic=True, color="7F4F00")
-        _leg.border = _bdr
-        _leg.value = (
-            f"Red = Party Confirmation (<{PARTY_CONFIRMATION_THRESHOLD}%) - manual verification required   "
-            f"Orange = Name Match ({PARTY_CONFIRMATION_THRESHOLD}-89%) - informational only   "
-            "Yellow = Amount difference - review and confirm"
-        )
-        _leg.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        for _col in range(2, 12):
-            ws7.cell(r7, _col).fill = NO_FILL
-            ws7.cell(r7, _col).border = _bdr
-        ws7.row_dimensions[r7].height = 16
-        r7 += 1
-        _brs_blank()
-
+    # Matched discrepancy details are intentionally not printed on the BRS sheet.
+    # Review items remain available in Matched, Cheque Deposit, and Human Verification.
     #  Footer notes
     ws7.merge_cells(f"A{r7}:K{r7}")
     ws7.cell(
