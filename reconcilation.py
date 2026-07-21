@@ -1943,9 +1943,11 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
     stmt["_used_cf"] = False
 
     def _norm_chq(c):
-        s = str(c).strip().lstrip("0")
+        s = str(c or "").strip().replace(".0", "")
+        if s.lower() in ("", "nan", "0", "99", "511", "-") or not re.fullmatch(r"\d{1,6}", s):
+            return "0"
+        s = s.lstrip("0")
         return s if s else "0"
-
     def _parse_date(d):
         s = str(d).strip()[:10].replace(".", "-").replace("/", "-")
         for fmt in ["%d-%m-%Y", "%Y-%m-%d", "%m-%d-%Y"]:
@@ -2909,7 +2911,7 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 if _row_has_return:
                     print(f"[CF] chq_cleared LAST-RESORT BLOCKED: chq={chq_no} "
                           f"amt={check_amount:,.2f} - stmt row has RETURN counterpart")
-                elif _ah_chq in ("", "nan", "0") or _norm_chq(_ah_chq) == _norm_chq(chq_no):
+                elif _norm_chq(_ah_chq) in GENERIC_CHQ or _norm_chq(_ah_chq) == _norm_chq(chq_no):
                     _ah_party = str(stmt.at[_ah_idx, "Party"])
                     _ah_score = fuzzy(rep_party, _ah_party)
                     if (_ah_chq not in ("", "nan", "0") and
@@ -5677,9 +5679,11 @@ def reconcile(book_df, stmt_df):
     CHQ_ABSENT = {"", "nan", "0", "99", "511"}  # FIX (COARP): 99/511 are generic, not real chq numbers
 
     def _norm_chq(c):
-        s = str(c).strip().lstrip("0")
+        s = str(c or "").strip().replace(".0", "")
+        if s.lower() in CHQ_ABSENT or not re.fullmatch(r"\d{1,6}", s):
+            return "0"
+        s = s.lstrip("0")
         return s if s else "0"
-
     def _chq_verdict(book_chq, bank_chq):
         b1 = _norm_chq(book_chq); b2 = _norm_chq(bank_chq)
         if b1 in CHQ_ABSENT or b2 in CHQ_ABSENT:
@@ -5706,6 +5710,23 @@ def reconcile(book_df, stmt_df):
         if _chq_verdict(br["Chq No"], sr["Chq No"]) == "reject": return False
         return True
 
+    def _has_bank_reference(value):
+        text = str(value or "").strip().replace("'", "")
+        return text.lower() not in CHQ_ABSENT and text not in ("", "-")
+
+    def _is_cash_deposit_book_row(br):
+        if str(br.get("Direction", "")).upper() != "INFLOW":
+            return False
+        if _norm_chq(br.get("Chq No", "")) not in CHQ_ABSENT:
+            return False
+        text = " ".join(str(br.get(c, "")) for c in ("Txn Type", "Narration"))
+        text_up = text.upper()
+        return "DEPOSIT WITHDRAWALS" in text_up and "CASH DEPOSIT" in text_up
+
+    def _is_cash_deposit_bank_row(sr):
+        text = f"{sr.get('Description', '')} {sr.get('Party', '')}".upper()
+        return "CASH DEPOSIT" in text or "CASH DEP" in text
+
     # -- Pre-pass: RT/PT refund pair detection --------------------------------
     # When the book has a 'Receipts' INFLOW (chq=generic) AND a 'Payments' OUTFLOW
     # (chq=real number) for the SAME party and SAME amount in the same period,
@@ -5722,7 +5743,7 @@ def reconcile(book_df, stmt_df):
         if br["Direction"] == "INFLOW":
             _receipt_keys.add((br["Party"], round(float(br["Book Amt (Rs)"]), 2)))
     for bi, br in book[book["Txn Type"] == "Payments"].iterrows():
-        if br["Direction"] == "OUTFLOW" and br["Chq No"] not in ("", "nan", "0"):
+        if br["Direction"] == "OUTFLOW" and _norm_chq(br["Chq No"]) not in CHQ_ABSENT:
             key = (br["Party"], round(float(br["Book Amt (Rs)"]), 2))
             if key in _receipt_keys:
                 _refund_pair_chqs.add(br["Chq No"])
@@ -5811,10 +5832,10 @@ def reconcile(book_df, stmt_df):
     # Amount, and Cheque Number (when present). Date is also checked.
     print("[Reconcile] Pass 1: Party Name + Direction + Amount + Cheque number match")
     processed_chqs = set()
-    for bi, br in book[(book["Chq No"].str.len() > 0) & (~book["_used"])].iterrows():
-        if br["Chq No"] in ("nan", ""): continue
+    for bi, br in book[~book["_used"]].iterrows():
+        chq = _norm_chq(br["Chq No"])
+        if chq in CHQ_ABSENT: continue
         if br.get("_refund_pair", False): continue  # RT/PT refund pair - skip matching
-        chq = br["Chq No"]
         if chq in processed_chqs: continue
 
         hits = stmt[
@@ -5838,7 +5859,7 @@ def reconcile(book_df, stmt_df):
             ]
             if same_chq_bank.empty: continue
             si = same_chq_bank.index[0]; sr = stmt.loc[si]
-            same_chq_book = book[(book["Chq No"] == chq) & (~book["_used"])]
+            same_chq_book = book[(book["Chq No"].apply(_norm_chq) == chq) & (~book["_used"])]
             same_chq_book = same_chq_book[same_chq_book.apply(
                 lambda r: r["Direction"] == sr["Direction"] and within_date(r.get("Date",""), sr["Date"]), axis=1)]
             if same_chq_book.empty: continue
@@ -5854,7 +5875,7 @@ def reconcile(book_df, stmt_df):
             continue
 
         si = hits.index[0]; sr = stmt.loc[si]
-        same_chq_book = book[(book["Chq No"] == chq) & (~book["_used"])]
+        same_chq_book = book[(book["Chq No"].apply(_norm_chq) == chq) & (~book["_used"])]
         same_chq_book = same_chq_book[same_chq_book.apply(
             lambda r: r["Direction"] == sr["Direction"] and within_date(r.get("Date",""), sr["Date"]), axis=1)]
 
@@ -5918,6 +5939,10 @@ def reconcile(book_df, stmt_df):
         candidates = candidates[candidates.apply(
             lambda sr: _chq_verdict(br["Chq No"], sr["Chq No"]) != "reject", axis=1)]
         if candidates.empty: continue
+        if _is_cash_deposit_book_row(br):
+            candidates = candidates[candidates.apply(_is_cash_deposit_bank_row, axis=1)]
+            if candidates.empty:
+                continue
         # Apply party name filter - soft: fall back to all candidates if none pass threshold
         name_cands = candidates[candidates.apply(
             lambda sr: fuzzy(br["Party"], sr["Party"]) >= FUZZY_THRESHOLD, axis=1)]
@@ -5928,7 +5953,7 @@ def reconcile(book_df, stmt_df):
             # name similarity is a false match. Require at least score >= 30.
             # This prevents e.g. "YESHWANTH M" matching "J K R GAS COMPANY" by 1L amount.
             _p2_generic = {"", "nan", "99", "511", "0"}
-            if str(br.get("Chq No", "")).strip() in _p2_generic:
+            if _norm_chq(br.get("Chq No", "")) in _p2_generic:
                 _min_cands = candidates[candidates.apply(
                     lambda sr: fuzzy(br["Party"], sr["Party"]) >= 30, axis=1)]
                 if _min_cands.empty:
@@ -6044,7 +6069,7 @@ def reconcile(book_df, stmt_df):
                        (stmt["Direction"] == "INFLOW") &
                        (stmt["Bank Amt (Rs)"] == 1.0)].iterrows():
         desc_re1  = sr["Description"].strip().upper()
-        chq_re1   = str(sr.get("Chq No", "")).strip()
+        chq_re1   = _norm_chq(sr.get("Chq No", ""))
         # Extract a meaningful UTR/ref prefix from the description (strip NEFT/RTGS/UPI/<refno>/)
         # e.g. "NEFT/HDFCH00123456/JOHN DOE/HDFC BANK" -> "HDFCH00123456/JOHN DOE/HDFC"
         desc_prefix_re1 = re.sub(r"^(NEFT|RTGS|IMPS|UPI)\b[^/]*/", "", desc_re1)[:25]
@@ -6053,7 +6078,7 @@ def reconcile(book_df, stmt_df):
         # Do NOT absorb on party-name alone - different transactions can share a party name.
         has_meaningful_prefix = len(desc_prefix_re1) >= 10
 
-        if not has_meaningful_prefix and not (chq_re1 and chq_re1 not in ("", "-", "nan")):
+        if not has_meaningful_prefix and chq_re1 in CHQ_ABSENT:
             # No UTR prefix and no reference number - cannot safely absorb
             print(f"[Reconcile] Pass 2b: SKIPPED Re1 (no UTR/ref to confirm linkage) - "
                   f"party='{sr['Party']}' desc='{sr['Description'][:50]}'")
@@ -6066,8 +6091,8 @@ def reconcile(book_df, stmt_df):
             (stmt.apply(lambda r: (
                 (has_meaningful_prefix and
                  desc_prefix_re1 in r["Description"].strip().upper()) or
-                (chq_re1 and chq_re1 not in ("", "-", "nan") and
-                 str(r.get("Chq No", "")).strip() == chq_re1)
+                (chq_re1 not in CHQ_ABSENT and
+                 _norm_chq(r.get("Chq No", "")) == chq_re1)
             ), axis=1))
         ]
         if not matched_peer.empty:
@@ -6089,7 +6114,7 @@ def reconcile(book_df, stmt_df):
     for bi, br in book[~book["_used"]].iterrows():
         if br.get("_refund_pair", False): continue
         if br["Direction"] != "INFLOW": continue
-        if str(br.get("Chq No", "")).strip() not in _GENERIC_CHQ: continue
+        if _norm_chq(br.get("Chq No", "")) not in _GENERIC_CHQ: continue
         # Only match Public Sale / FFMC Sale - not Receipts or other types
         if str(br.get("Txn Type", "")).strip() not in _P2C_TXN_TYPES: continue
         b_amt  = round(float(br["Book Amt (Rs)"]), 2)
@@ -6279,7 +6304,22 @@ def reconcile(book_df, stmt_df):
                 if not within_date(book.at[bi2,"Date"] if "Date" in book.columns else "", s_date): continue
                 if _chq_verdict(book.at[bi1,"Chq No"], sr["Chq No"]) == "reject": continue
                 if _chq_verdict(book.at[bi2,"Chq No"], sr["Chq No"]) == "reject": continue
-                score = max(fuzzy(book.at[bi1,"Party"],sr["Party"]), fuzzy(book.at[bi2,"Party"],sr["Party"]))
+                score1 = fuzzy(book.at[bi1,"Party"], sr["Party"])
+                score2 = fuzzy(book.at[bi2,"Party"], sr["Party"])
+                score = max(score1, score2)
+                bank_chq_real = _has_bank_reference(sr.get("Chq No", ""))
+                book_chqs_generic = (
+                    _norm_chq(book.at[bi1,"Chq No"]) in CHQ_ABSENT and
+                    _norm_chq(book.at[bi2,"Chq No"]) in CHQ_ABSENT
+                )
+                book_parties_differ = _split_party_key(book.at[bi1,"Party"]) != _split_party_key(book.at[bi2,"Party"])
+                if bank_chq_real and book_chqs_generic and book_parties_differ:
+                    if min(score1, score2) < FUZZY_THRESHOLD:
+                        print(f"[Reconcile] Pass 3b BLOCKED mixed-party generic split: "
+                              f"book='{book.at[bi1,'Party']}' + '{book.at[bi2,'Party']}' "
+                              f"against bank='{sr['Party']}' chq={sr.get('Chq No','')} "
+                              f"scores={score1}%/{score2}%")
+                        continue
                 if score < FUZZY_THRESHOLD: continue  # name must match for at least one book entry
                 bank_total = float(sr["Bank Amt (Rs)"])
                 bank_dt    = sr["Date"]
@@ -7629,8 +7669,8 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      float(row_data.get("Book Amt (Rs)", 0) or 0), row_data.get("Narration", ""),
                      is_cf=False, book_raw=str(row_data.get("Party Raw", row_data.get("Party", ""))),
                      bank_raw="", is_rejected=False)
-            # Display only - already reconciled; do not add to total_deposited.
-        # Show cleared CF book rows - display only, not counted in balance
+            total_deposited += float(row_data.get("Book Amt (Rs)", 0) or 0)
+        # Show cleared CF book rows and include them in the section subtotal.
         _shown_keys = set()
         for _cl, _br in _backdated_book_rows:
             _key = (str(_br.get("Bill No","")), str(_br.get("Date","")),
@@ -7651,7 +7691,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _book_raw = str(_br.get("Party Raw", _party))
             item_row(_br.get("Date",""), _txn, _bill, _chq, _party, _amt, _narr,
                      is_cf=False, book_raw=_book_raw, bank_raw="")
-            # NOT added to total_deposited - already reconciled via 4B match
+            total_deposited += _amt
     subtotal_row(total_deposited)
     running -= total_deposited
     running_row(running)
@@ -7893,7 +7933,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      is_rejected=rejected)
             if not bool(row_data.get("_brs_residual_exclude", False)) and not _is_nullified:
                 total_credited += _display_amt
-        # Show cleared CF bank credits - display only, not counted in balance
+        # Show cleared CF bank credits and include them in the section subtotal.
         for row_data in _credited_chq_review:
             _desc = str(row_data.get("Description", ""))
             _party = str(row_data.get("Party", "")) or _desc
@@ -7901,7 +7941,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
                      _party, float(row_data.get("Bank Amt (Rs)", 0) or 0),
                      row_data.get("Narration", ""), is_cf=False,
                      book_raw="", bank_raw=_desc, is_rejected=False)
-            # Display only - already reconciled; do not add to total_credited.
+            total_credited += float(row_data.get("Bank Amt (Rs)", 0) or 0)
         for _cl in _backdated_cnb:
             _amt   = float(_cl.get("_display_amt",  _cl.get("amount", 0)) or 0)
             _party = str(_cl.get("_display_party",  _cl.get("party", "")))
@@ -7914,7 +7954,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
             item_row(_date, "", "", _chq, _party, _amt, _narr,
                      is_cf=True, book_raw="", bank_raw=_desc)
-            # NOT added to total_credited - this credit is already reconciled
+            total_credited += _amt
         if credited_not_book.empty and _backdated_cnb:
             # All entries are display-only cleared items - show nil for balance
             pass
@@ -10268,6 +10308,60 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
                       f"opening={float(book_opening_bal or 0.0):,.2f} "
                       f"gap=Rs{_opening_drop:,.2f}")
 
+    # Previous-day issued cheques can be absent from compact/manual previous BRS
+    # exports even though the current book opening has already moved past them.
+    # When the prior BRS has no issued_not_debited rows, the current book has no
+    # outflows, and a real current bank debit remains unmatched, treat that debit
+    # as clearing an implicit previous-day issued cheque. This restores the 4B
+    # clear without touching current-period receipt/cash-deposit matching.
+    if prev_brs and book_opening_bal is not None and not stmt_only.empty:
+        _has_prev_issued = bool(prev_brs.get("issued_not_debited", []))
+        _current_book_outflow = (
+            not book_df.empty and
+            "Direction" in book_df.columns and
+            (book_df["Direction"].astype(str).str.upper() == "OUTFLOW").any()
+        )
+        _opening_moved = abs(
+            float(prev_brs.get("prev_book_closing_bal", 0.0) or 0.0) -
+            float(book_opening_bal or 0.0)
+        ) > 0.01
+        if not _has_prev_issued and not _current_book_outflow and _opening_moved:
+            _stmt_debits = stmt_only[
+                stmt_only["Direction"].astype(str).str.upper().eq("OUTFLOW")
+            ]
+            _drop_stmt_idxs = []
+            for _si, _sr in _stmt_debits.iterrows():
+                _bank_ref = str(_sr.get("Chq No", "") or "").strip()
+                _bank_ref_clean = str(_bank_ref or "").strip().replace("'", "").replace("\u0027", "")
+                if _bank_ref_clean.lower() in ("", "nan", "0", "99", "511", "-"):
+                    continue
+                _amt = float(_sr.get("Bank Amt (Rs)", 0) or 0)
+                if _amt <= 0:
+                    continue
+                _party = str(_sr.get("Party", "") or "").strip()
+                _desc = str(_sr.get("Description", "") or "").strip()
+                _derived_party = _party or extract_party_from_desc(_desc)
+                cleared_log.append({
+                    "section": "issued_not_debited",
+                    "date": str(_sr.get("Date", "")),
+                    "txn_type": "PB",
+                    "bill_no": "",
+                    "chq_no": _bank_ref_clean,
+                    "party": _derived_party,
+                    "party_raw": _desc or _derived_party,
+                    "description": _desc or _derived_party,
+                    "amount": _amt,
+                    "narration": "Recovered previous-day issued cheque from current bank debit",
+                    "status": "CLEARED",
+                    "cleared_by_stmt_rows": [_sr.drop(labels=["_used_cf"], errors="ignore").to_dict()],
+                    "backdated_clear": True,
+                })
+                _drop_stmt_idxs.append(_si)
+                print(f"[Process] Previous-day issued cheque recovered from bank debit: "
+                      f"chq={_bank_ref_clean} party='{_derived_party}' Rs{_amt:,.2f}")
+            if _drop_stmt_idxs:
+                stmt_only = stmt_only.drop(index=_drop_stmt_idxs)
+
     matched, book_only, stmt_only, _sbi_transfer_fix = apply_sbi_transfer_rectification(
         matched, book_only, stmt_only, bank_name_hint=bank_name_hint, branch_label=branch_label
     )
@@ -11373,3 +11467,5 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             process_files(args.book_file, sf, bank_output, args.prev_brs)
         print(f"\nAll {len(stmt_files)} banks processed.")
+
+
