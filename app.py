@@ -211,7 +211,7 @@ def post_reconciliation(transaction_info):
 # NORMAL BANK RECONCILIATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/reconcile", summary="Upload book report, bank statement and previous BRS file.")
+@app.post("/workflow/reconcile", summary="Upload book report, bank statement and previous BRS file.")
 async def reconcile_endpoint(
     book_file:         UploadFile = File(...),
     statement_file:    UploadFile = File(...),
@@ -382,7 +382,7 @@ async def reconcile_endpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
-    "/reconcile-qr",
+    "/workflow/reconcile-qr",
     summary="QR reconciliation — 4 files: All-Branches book, HOT QRHDFC book, QR gateway statement, Previous BRS.",
 )
 async def reconcile_qr_endpoint(
@@ -650,7 +650,7 @@ async def reconcile_qr_endpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
-    "/reconcile-gateway",
+    "/workflow/reconcile-gateway",
     summary=(
         "Gateway YES Bank reconciliation — "
         "All-Branches book (.xls), HOT book (.xls), YES Bank PDF statement, "
@@ -996,7 +996,7 @@ def root():
     }
 
 
-@app.get("/file-download", summary="Download all archived transactions as a zip.")
+@app.get("/workflow/file-download", summary="Download all archived transactions as a zip.")
 def file_download(background_tasks: BackgroundTasks):
     if not os.path.isdir(TRANSACTIONS_DIR) or not os.listdir(TRANSACTIONS_DIR):
         raise HTTPException(status_code=404, detail="No transactions archived yet.")
