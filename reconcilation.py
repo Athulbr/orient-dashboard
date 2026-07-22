@@ -6251,6 +6251,21 @@ def reconcile(book_df, stmt_df):
 
     print("[Reconcile] Pass 3b: Combined same-party book amount -> single bank entry")
     p3b_start = len(matched_rows)
+
+    def _make_3b_split_row(book_row, bank_row, split_score, split_note, part_num, bank_total):
+        row = _make_row(book_row, bank_row, "3b-Party+Combined Amt+Date", split_score, partial_note=split_note)
+        row["Amount Match"] = "Split Bills 1 Credit"
+        row["Difference (Rs)"] = 0.0
+        row["Bank Full Amt"] = bank_total
+        row["_display_difference"] = 0.0 if part_num == 1 else ""
+        row["_display_bank_amt"] = bank_total if part_num == 1 else ""
+        row["_display_debit"] = row["Debit (Rs)"] if part_num == 1 else ""
+        row["_display_credit"] = row["Credit (Rs)"] if part_num == 1 else ""
+        if part_num > 1:
+            row["Debit (Rs)"] = 0.0
+            row["Credit (Rs)"] = 0.0
+            row["Bank Amt (Rs)"] = 0.0
+        return row
     for si, sr in stmt[~stmt["_used"]].iterrows():
         s_dir = sr["Direction"]
         cands = book[(~book["_used"]) & (book["Direction"] == s_dir)]
@@ -6288,7 +6303,7 @@ def reconcile(book_df, stmt_df):
                         f"Book Rs{part_amt:,.2f} ({split_list}) = "
                         f"Bank Rs{bank_total:,.2f} dated {bank_dt} - "
                         f"confirm all {n_parts} parts are recorded in books")
-                matched_rows.append(_make_row(book.loc[idx], sr, "3b-Party+Combined Amt+Date", score, partial_note=note))
+                matched_rows.append(_make_3b_split_row(book.loc[idx], sr, score, note, part_num, bank_total))
                 book.at[idx, "_used"] = True
             stmt.at[si, "_used"] = True
             print(f"[Reconcile] Pass 3b split: {n_parts} '{book.at[matched_idxs[0], 'Party']}' entries = bank Rs{bank_total:,.2f}")
@@ -6331,8 +6346,8 @@ def reconcile(book_df, stmt_df):
                 note2 = (f"PARTIAL PAYMENT - Part 2 of 2: Book Rs{amt2:,.2f} + Rs{amt1:,.2f} "
                          f"= Bank Rs{bank_total:,.2f} dated {bank_dt} - "
                          f"confirm both parts are recorded in books")
-                matched_rows.append(_make_row(book.loc[bi1], sr, "3b-Party+Combined Amt+Date", score, partial_note=note1))
-                matched_rows.append(_make_row(book.loc[bi2], sr, "3b-Party+Combined Amt+Date", score, partial_note=note2))
+                matched_rows.append(_make_3b_split_row(book.loc[bi1], sr, score, note1, 1, bank_total))
+                matched_rows.append(_make_3b_split_row(book.loc[bi2], sr, score, note2, 2, bank_total))
                 book.at[bi1,"_used"] = True; book.at[bi2,"_used"] = True; stmt.at[si,"_used"] = True
                 found = True; break
             if found: break
@@ -6719,7 +6734,9 @@ def _make_row(br, sr, method, score, partial_note=""):
         if allow_book_placeholder:
             absent.discard("99")
             absent.discard("511")
-        return text if text.lower() not in absent else ""
+        if text.lower() in absent or not re.fullmatch(r"\d{1,6}", text):
+            return ""
+        return text
 
     bank_chq = _real_chq(sr.get("Chq No", ""))
     _book_chq_raw = str(br.get("Chq No", "") or "").strip().lower()
@@ -7370,6 +7387,86 @@ def build_brs_sheet(wb, book_only, stmt_only,
     HOT_TXN_TYPES = {"Payments", "PAYMENTS", "payments"}
     GENERIC_CHQ_VALS = {"99", "511", "0", "", "nan"}
 
+    def _same_display_amount(left, right):
+        try:
+            return abs(round(float(left or 0), 2) - round(float(right or 0), 2)) < 0.01
+        except (TypeError, ValueError):
+            return False
+
+    def _book_review_already_visible(mr):
+        if book_only is None or book_only.empty:
+            return False
+        for _, br in book_only.iterrows():
+            if (
+                str(br.get("Date", "")).strip() == str(mr.get("Book Date", "")).strip() and
+                str(br.get("Bill No", "")).strip() == str(mr.get("Book Bill No", "")).strip() and
+                str(br.get("Chq No", "")).strip() == str(mr.get("Book Chq", "")).strip() and
+                str(br.get("Party", "")).strip().upper() == str(mr.get("Book Party", "")).strip().upper() and
+                str(br.get("Direction", "")).strip().upper() == str(mr.get("Book Direction", "")).strip().upper() and
+                _same_display_amount(br.get("Book Amt (Rs)", 0), mr.get("Book Amt (Rs)", 0))
+            ):
+                return True
+        return False
+
+    def _bank_review_already_visible(mr):
+        if stmt_only is None or stmt_only.empty:
+            return False
+        for _, sr in stmt_only.iterrows():
+            if (
+                str(sr.get("Date", "")).strip() == str(mr.get("Bank Date", "")).strip() and
+                str(sr.get("Chq No", "")).strip() == str(mr.get("Bank Chq", "")).strip() and
+                str(sr.get("Description", "")).strip() == str(mr.get("Bank Description", "")).strip() and
+                str(sr.get("Party", "")).strip().upper() == str(mr.get("Bank Party", "")).strip().upper() and
+                str(sr.get("Direction", "")).strip().upper() == str(mr.get("Bank Direction", "")).strip().upper() and
+                _same_display_amount(sr.get("Bank Amt (Rs)", 0), mr.get("Bank Amt (Rs)", 0))
+            ):
+                return True
+        return False
+
+    def _cheque_diff_note_from_match(mr):
+        return next(
+            (seg for seg in str(mr.get("Flags", "")).split(" | ") if "Cheque no differs" in seg),
+            "Cheque no differs"
+        )
+
+    def _append_display_note(df, idx, note):
+        if "Narration" not in df.columns:
+            df["Narration"] = ""
+        old = str(df.at[idx, "Narration"] or "").strip()
+        if note.lower() in old.lower():
+            return
+        df.at[idx, "Narration"] = f"{old} | {note}".strip(" |") if old else note
+
+    def _visible_book_review_idx(mr):
+        if book_only is None or book_only.empty:
+            return None
+        for _idx, br in book_only.iterrows():
+            if (
+                str(br.get("Date", "")).strip() == str(mr.get("Book Date", "")).strip() and
+                str(br.get("Bill No", "")).strip() == str(mr.get("Book Bill No", "")).strip() and
+                str(br.get("Chq No", "")).strip() == str(mr.get("Book Chq", "")).strip() and
+                str(br.get("Party", "")).strip().upper() == str(mr.get("Book Party", "")).strip().upper() and
+                str(br.get("Direction", "")).strip().upper() == str(mr.get("Book Direction", "")).strip().upper() and
+                _same_display_amount(br.get("Book Amt (Rs)", 0), mr.get("Book Amt (Rs)", 0))
+            ):
+                return _idx
+        return None
+
+    def _visible_bank_review_idx(mr):
+        if stmt_only is None or stmt_only.empty:
+            return None
+        for _idx, sr in stmt_only.iterrows():
+            if (
+                str(sr.get("Date", "")).strip() == str(mr.get("Bank Date", "")).strip() and
+                str(sr.get("Chq No", "")).strip() == str(mr.get("Bank Chq", "")).strip() and
+                str(sr.get("Description", "")).strip() == str(mr.get("Bank Description", "")).strip() and
+                str(sr.get("Party", "")).strip().upper() == str(mr.get("Bank Party", "")).strip().upper() and
+                str(sr.get("Direction", "")).strip().upper() == str(mr.get("Bank Direction", "")).strip().upper() and
+                _same_display_amount(sr.get("Bank Amt (Rs)", 0), mr.get("Bank Amt (Rs)", 0))
+            ):
+                return _idx
+        return None
+
     def _matched_chq_review_rows(book_direction):
         """Matched cheque-number differences shown in normal BRS sections.
         Display only: these rows are already reconciled and must not affect totals.
@@ -7384,6 +7481,13 @@ def build_brs_sheet(wb, book_only, stmt_only,
         rows = []
         seen = set()
         for _, mr in review_df.iterrows():
+            _visible_idx = _visible_book_review_idx(mr)
+            if _visible_idx is not None:
+                if re.fullmatch(r"\d{1,6}", str(mr.get("Bank Chq", "")).strip()):
+                    _append_display_note(book_only, _visible_idx, _cheque_diff_note_from_match(mr))
+                continue
+            if not re.fullmatch(r"\d{1,6}", str(mr.get("Bank Chq", "")).strip()):
+                continue
             key = (
                 str(mr.get("Book Bill No", "")).strip(),
                 str(mr.get("Book Chq", "")).strip(),
@@ -7423,6 +7527,13 @@ def build_brs_sheet(wb, book_only, stmt_only,
         rows = []
         seen = set()
         for _, mr in review_df.iterrows():
+            _visible_idx = _visible_bank_review_idx(mr)
+            if _visible_idx is not None:
+                if re.fullmatch(r"\d{1,6}", str(mr.get("Bank Chq", "")).strip()):
+                    _append_display_note(stmt_only, _visible_idx, _cheque_diff_note_from_match(mr))
+                continue
+            if not re.fullmatch(r"\d{1,6}", str(mr.get("Bank Chq", "")).strip()):
+                continue
             key = (
                 str(mr.get("Bank Date", "")).strip(),
                 str(mr.get("Book Chq", "")).strip(),
@@ -7565,10 +7676,26 @@ def build_brs_sheet(wb, book_only, stmt_only,
 
     def _get_4b_score(cl, br=None):
         """Return fuzzy score for a 4B cleared entry."""
-        # 1. Use stored fuzzy_score if available
-        _stored = cl.get("fuzzy_score", None)
+        # 1. Use stored score if available. Different CF paths were added over
+        # time and do not all use the same key name.
+        _stored = None
+        for _score_key in ("fuzzy_score", "score", "Fuzzy Score %"):
+            if cl.get(_score_key, None) is not None:
+                _stored = cl.get(_score_key)
+                break
         if _stored is not None:
-            return int(_stored)
+            try:
+                return int(round(float(_stored)))
+            except (TypeError, ValueError):
+                pass
+        # 1b. For credited_not_book backdated clears, the current book row is
+        # the confirmation evidence. If its party is below 50% against the
+        # previous-BRS party, it must remain visible in the BRS statement.
+        if br is not None:
+            _cl_party = str(cl.get("party", "")).strip()
+            _br_party = str(br.get("Party", br.get("party", ""))).strip()
+            if _cl_party and _br_party:
+                return fuzzy(_cl_party, _br_party)
         # 2. Look up matched_df by bill_no then party+amount
         if matched_df is not None and not matched_df.empty:
             _bill  = str((br or cl).get("Bill No", cl.get("bill_no", ""))).strip()
@@ -7680,7 +7807,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _shown_keys.add(_key)
             _amt   = round(float(_br.get("Book Amt (Rs)", 0) or 0), 2)
             _narr  = str(_br.get("Narration", "") or "").replace("[CF from prev BRS]", "").strip(" |")
-            _score = _get_4b_score(_cl)
+            _score = _get_4b_score(_cl, _br)
             # Append name-mismatch flag same style as regular unmatched rows
             _name_note = f"Name {_score}% -- verify"
             _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
@@ -7840,13 +7967,17 @@ def build_brs_sheet(wb, book_only, stmt_only,
         if not str(_cl.get("status", "")).startswith("CLEARED"):
             continue
         _sec = _cl.get("section", "")
-        _sc  = _get_4b_score(_cl)
-        if _sc >= PARTY_CONFIRMATION_THRESHOLD:
-            continue
         if (_sec == "credited_not_book" and
                 _cl.get("backdated_clear") and _cl.get("cleared_by_book_rows")):
-            _backdated_cnb.append(_cl)
+            _book_scores = [_get_4b_score(_cl, _br)
+                            for _br in (_cl.get("cleared_by_book_rows", []) or [])]
+            _sc = min(_book_scores) if _book_scores else _get_4b_score(_cl)
+            if _sc < PARTY_CONFIRMATION_THRESHOLD:
+                _backdated_cnb.append({**_cl, "_display_score": _sc})
         elif _sec == "deposited_not_credited" and _cl.get("cleared_by_stmt_rows"):
+            _sc = _get_4b_score(_cl)
+            if _sc >= PARTY_CONFIRMATION_THRESHOLD:
+                continue
             # Bank entry was consumed - show it here using the stmt row details
             _sr_list = _cl.get("cleared_by_stmt_rows", []) or []
             for _sr in _sr_list:
@@ -7949,7 +8080,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _date  = str(_cl.get("_display_date",   _cl.get("date", "")))
             _chq   = str(_cl.get("_display_chq",    _cl.get("chq_no", "")))
             _narr  = str(_cl.get("narration", "") or "").replace("[CF from prev BRS]", "").strip(" |")
-            _score = _get_4b_score(_cl)
+            _score = int(_cl.get("_display_score", _get_4b_score(_cl)) or 0)
             _name_note = f"Name {_score}% -- verify"
             _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
             item_row(_date, "", "", _chq, _party, _amt, _narr,
@@ -9152,11 +9283,12 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
     for i, (_, r) in enumerate(matched.iterrows(), 3):
         nm        = r["Name Match"]
         am        = r["Amount Match"]
-        diff      = r["Difference (Rs)"]
+        diff      = r.get("_display_difference", r["Difference (Rs)"])
+        diff_num  = 0.0 if diff == "" else float(diff or 0)
         is_pp     = bool(r.get("Partial Payment", False))
         nf   = _G  if nm == "Match"  else (_Y if "Partial" in nm else _R)
-        af   = _G  if am in ("Exact", "CF-Clear") else (_Y if "Minor" in am else _R)
-        df   = _G  if abs(diff) < 0.01 else (_Y if abs(diff) < 500 else _R)
+        af   = _G  if am in ("Exact", "CF-Clear", "Split Bills 1 Credit") else (_Y if "Minor" in am else _R)
+        df   = _G  if abs(diff_num) < 0.01 else (_Y if abs(diff_num) < 500 else _R)
         ff   = _PP if is_pp else (_R if r["Flags"] else _W)
         pp_label = "YES - verify" if is_pp else ""
         vals = [r["Match Method"], r["Name Match"], r["Fuzzy Score %"], r["Amount Match"],
@@ -9164,7 +9296,7 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
                 r["Book Direction"], r["Book Amt (Rs)"],
                 r["Bank Date"], r["Bank Chq"], r["Bank Description"], r["Bank Party"],
                 r["Bank Direction"],
-                r["Debit (Rs)"], r["Credit (Rs)"], r["Bank Amt (Rs)"],
+                r.get("_display_debit", r["Debit (Rs)"]), r.get("_display_credit", r["Credit (Rs)"]), r.get("_display_bank_amt", r["Bank Amt (Rs)"]),
                 diff, pp_label, r["Flags"]]
         fills = [_W, nf, nf, af,
                  _W, _GR, _W, _W, nf, _W, _G,
@@ -11327,7 +11459,9 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
 
         def _brs_real_bank_chq(value):
             text = str(value or "").strip()
-            return text if text.lower() not in {"", "nan", "0", "99", "511", "-"} else ""
+            if text.lower() in {"", "nan", "0", "99", "511", "-"} or not re.fullmatch(r"\d{1,6}", text):
+                return ""
+            return text
 
         def _brs_book_chq_for_review(value, bank_chq):
             text = str(value or "").strip()

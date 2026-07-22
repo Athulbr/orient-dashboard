@@ -1,4 +1,3 @@
-
 import re
 import sys
 from copy import copy
@@ -1635,6 +1634,7 @@ def process_qr_files(
                 "amount": float(_r[_PREV_DATA_COL]),
                 "party": str(_r[_PREV_PARTY_COL]).strip(),
                 "ref": str(_r[3]).strip(),
+                "note": _prev_row_comment(_r, _PREV_DATA_COL),
             }
         )
 
@@ -1643,6 +1643,8 @@ def process_qr_files(
         bank_amt = float(bank_row.get("amount(rs.)", 0) or 0)
         bank_party = normalize_party(str(bank_row.get(name_col, "")))
         for _cf in _prev_dnc_exact_lookup:
+            if _cf.get("note"):
+                continue
             if _cf["branch"] != bank_branch:
                 continue
             if abs(_cf["amount"] - bank_amt) > 0.005:
@@ -2733,6 +2735,7 @@ def process_qr_files(
                 "amount": float(r[_PREV_DATA_COL]),
                 "diff": diff,
                 "remark": prev_comment,
+                "has_prev_note": bool(prev_comment),
                 "cf": True,
             }
         )
@@ -2767,6 +2770,8 @@ def process_qr_files(
         for ci in candidates:
             if ci in cnb_cf_cleared:
                 continue
+            if cnb_cf[ci].get("has_prev_note"):
+                continue
             cf_amt = cnb_cf[ci]["amount"]
             amt_diff = abs(cf_amt - d_amt)
             if amt_diff > _4B_AMT_DIFF_MAX:
@@ -2787,6 +2792,7 @@ def process_qr_files(
                 ci
                 for ci in candidates
                 if ci not in cnb_cf_cleared
+                and not cnb_cf[ci].get("has_prev_note")
                 and abs(cnb_cf[ci]["amount"] - d_amt) <= 0.005
             ]
             if len(exact_amount_candidates) == 1:
@@ -2846,7 +2852,11 @@ def process_qr_files(
             continue
         br = dnc_item["branch"]
         d_amt = dnc_item["amount"]
-        candidates = [ci for ci in cnb_cf_pool.get(br, []) if ci not in cnb_cf_cleared]
+        candidates = [
+            ci
+            for ci in cnb_cf_pool.get(br, [])
+            if ci not in cnb_cf_cleared and not cnb_cf[ci].get("has_prev_note")
+        ]
         if len(candidates) < 2:
             continue
         found_split = False
@@ -3173,7 +3183,7 @@ def process_qr_files(
         diff = r[note_col] if pd.notna(r[note_col]) else None
         bill_no = str(r[2]).strip()
         # FIX: If this CF DNC bill was already matched this cycle, don't re-add as CF.
-        if _dnc_key(r[1], bill_no, r[_PREV_DATA_COL]) in all_matched_dnc_keys:
+        if _dnc_key(r[1], bill_no, r[_PREV_DATA_COL]) in all_matched_dnc_keys and not note:
             print(
                 f"  [CF-SKIP] Bill {bill_no} already matched this cycle  skipping DNC carry-forward"
             )
@@ -3188,6 +3198,7 @@ def process_qr_files(
                 "diff": diff,
                 "note": note,
                 "remark": remark,
+                "has_prev_note": bool(note),
                 "cf": True,
             }
         )
@@ -3220,8 +3231,12 @@ def process_qr_files(
 
     if BRS_DATE != "02.05.2026":
         for di, dnc_item in enumerate(dnc_cf):
+            if dnc_item.get("has_prev_note"):
+                continue
             for ci, cnb_item in enumerate(cnb_cf_remaining):
                 if ci in prev_cnb_cleared:
+                    continue
+                if cnb_item.get("has_prev_note"):
                     continue
                 if dnc_item["branch"] != cnb_item["branch"]:
                     continue
@@ -3287,6 +3302,11 @@ def process_qr_files(
         return abs(amount_diff) <= _4B_AMT_DIFF_MAX and name_score >= FUZZY_ACCEPT
 
     for di, dnc_item in enumerate(dnc_cf):
+        if dnc_item.get("has_prev_note"):
+            print(
+                f"  [CF-KEEP] Previous DNC {dnc_item.get('branch', '')}/{dnc_item.get('ref', '')} has note/narration - keeping in BRS"
+            )
+            continue
         br = dnc_item["branch"]
         d_amt = dnc_item["amount"]
         candidates = [
@@ -4012,6 +4032,18 @@ def process_qr_files(
     _rrn_counts = stmt_success["rrn no"].astype(str).value_counts()
     _duplicate_rrns = set(_rrn_counts[_rrn_counts > 1].index)
 
+    def _cheque_display_key(book_date, branch, bill, party, amount):
+        try:
+            amt_key = round(float(amount), 2)
+        except (TypeError, ValueError):
+            amt_key = str(amount).strip()
+        return (
+            str(book_date).strip(),
+            str(branch).strip().upper(),
+            str(bill).strip(),
+            str(party).strip().upper(),
+            amt_key,
+        )
     #  Sheet 1  Cheque Deposit
     ws = wb.active
     ws.title = "Cheque Deposit"
@@ -4057,12 +4089,16 @@ def process_qr_files(
         ignore_index=True,
         sort=False,
     )
+    _cheque_display_keys = set()
 
     for _, row in _cheque_book_rows.iterrows():
         r += 1
         dt = row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else ""
         bill = row["bill_no"]
         party = "INDIVI - " + row["party"]
+        _cheque_display_keys.add(
+            _cheque_display_key(dt, row["branch"], bill, party, row["amount"])
+        )
         key = (bill, row["amount"])
         dnc_row_key = _dnc_key(row.get("branch", ""), bill, row["amount"])
 
@@ -4880,6 +4916,8 @@ def process_qr_files(
 
     # Add Matched-sheet transactions in the Cheque Deposit display format.
     # This is display-only: it does not affect matching or BRS arithmetic.
+    # Keep a Cheque Deposit-specific append row; r is reused by other sheets.
+    _cheque_append_row = ws.max_row
     for _src in ws3.iter_rows(min_row=3, values_only=True):
         _method = _src[0] if len(_src) > 0 else ""
         _book_date = _src[4] if len(_src) > 4 else ""
@@ -4899,6 +4937,12 @@ def process_qr_files(
         _diff = _src[18] if len(_src) > 18 and _src[18] not in (None, "") else None
         _flags = str(_src[19] if len(_src) > 19 and _src[19] else "").strip()
 
+        _display_key = _cheque_display_key(
+            _book_date, _book_branch, _book_bill, _book_party, _book_amt
+        )
+        if _display_key in _cheque_display_keys:
+            continue
+        _cheque_display_keys.add(_display_key)
         if str(_method).startswith("Receipt-ZEROISE"):
             _narration = _flags or "RECEIPTS TRANSACTION - display only"
         elif _bank_date:
@@ -4917,7 +4961,7 @@ def process_qr_files(
         if isinstance(_diff, (int, float)) and abs(_diff) > 0.005:
             _diff_display = _diff
 
-        r += 1
+        _cheque_append_row += 1
         for c, v in enumerate(
             [
                 _book_date,
@@ -4937,7 +4981,7 @@ def process_qr_files(
             diff_bg = C_RED if (c == 10 and _diff_display is not None) else None
             set_cell(
                 ws,
-                r,
+                _cheque_append_row,
                 c,
                 v,
                 bg=diff_bg,
@@ -5265,35 +5309,10 @@ def process_qr_files(
         nonlocal r7
         bg = _ITM_CF if is_cf else _ITM
 
-        # Build display narration:
-        # Show only (a) narrations from source documents, and (b) important flags.
-        # Strip all script-generated CF labels that carry no source information.
-        _FLAG_KEYWORDS = (
-            "LOW NAME",
-            "PARTIAL NAME",
-            "NAME VERIFY",
-            "AMOUNT DIFFERENCE",
-            "WRONGLY ACCOUNTED",
-            "DUPLICATE RRN",
-            "KNOWN LARGE",
-            "VERIFY",
-            "CORRECTION",
-            "SPLIT",
-            "MISMATCH",
-            "CHECK",
-        )
-        _raw = str(narr or "").strip()
-        _cf_prefixes = ("Carried Fwd", "CF |", "CF|", "CARRIED FORWARD")
-        _cleaned = _raw
-        for _pfx in _cf_prefixes:
-            if _cleaned.upper().startswith(_pfx.upper()):
-                _cleaned = _cleaned[len(_pfx) :].lstrip(" |").strip()
-        _has_flag = any(kw in _cleaned.upper() for kw in _FLAG_KEYWORDS)
-        display_narr = (
-            _cleaned
-            if (_cleaned and (_has_flag or not _raw.upper().startswith("CF")))
-            else ""
-        )
+        # For the BRS statement, do not invent or rewrite narration text.
+        # CF rows already receive only the previous-BRS human note/remark from
+        # _prev_row_comment(); write that value as-is so it is never nullified.
+        display_narr = str(narr or "").strip()
 
         def _s(col, val, halign="left"):
             c = ws7.cell(r7, col, val)
@@ -6460,3 +6479,7 @@ if __name__ == "__main__":
         prev_brs_path=args.prev_brs,
         brs_date_override=args.date,
     )
+
+
+
+
