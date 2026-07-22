@@ -1,3 +1,4 @@
+
 import re
 import sys
 from copy import copy
@@ -4271,7 +4272,8 @@ def process_qr_files(
     # shown with the actual credited date and RRN so the credit can be
     # traced back to the original book entry from the prior period.
     # ------------------------------------------------------------------ #
-    if QR_BANK_KIND == "YES" and (prev_dnc_current_cnb_matches or step4b_matched):
+    _has_pending_settlement_tracker = QR_BANK_KIND == "YES" and (prev_dnc_current_cnb_matches or step4b_matched)
+    if _has_pending_settlement_tracker:
         r += 2
         _pt_fill_hex = "FCE4D6"
         ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=11)
@@ -4319,7 +4321,7 @@ def process_qr_files(
                     for part_no, part in enumerate(cnb_parts, 1)
                 ]
                 if cnb_parts
-                else [(cnb, cnb["amount"])]
+                else [(cnb, dnc["amount"])]
             )
             for part_no, (cnb_row, row_amt) in enumerate(display_rows, 1):
                 credited_dt = cnb_row.get("settlement_date", "") or cnb_row.get(
@@ -4345,46 +4347,8 @@ def process_qr_files(
                         ),
                     ]
                 )
-        for pair in step4b_matched:
-            dnc, cnb = pair["dnc"], pair["cnb"]
-            cnb_parts = cnb.get("parts", []) or []
-            dnc_parts = dnc.get("parts", []) or []
-            if cnb_parts:
-                display_rows = [
-                    (dnc, {**cnb, **part}, dnc["amount"] if part_no == 1 else None)
-                    for part_no, part in enumerate(cnb_parts, 1)
-                ]
-            elif dnc_parts:
-                display_rows = [
-                    ({**dnc, **part}, cnb, part.get("amount", dnc["amount"]))
-                    for part in dnc_parts
-                ]
-            else:
-                display_rows = [(dnc, cnb, dnc["amount"])]
-            for part_no, (dnc_row, cnb_row, row_amt) in enumerate(display_rows, 1):
-                credited_dt = cnb_row.get("settlement_date", "") or cnb_row.get(
-                    "date", ""
-                )
-                _pt_rows.append(
-                    [
-                        dnc_row["date"],
-                        dnc_row["branch"],
-                        QR_ACCOUNT_CODE,
-                        dnc_row["ref"],
-                        511,
-                        cnb_row.get("rrn", ""),
-                        cnb_row.get("payment_mode", ""),
-                        dnc_row["party"],
-                        row_amt,
-                        credited_dt,
-                        f"BACKDATED CLEAR, CREDITED AS ON {credited_dt}"
-                        + (
-                            ""
-                            if len(display_rows) == 1
-                            else f"  (split {part_no}/{len(display_rows)})"
-                        ),
-                    ]
-                )
+        # Step 4B rows clear current book entries against previous CNB items; they are not previous-BRS DNC rows.
+        # Keep this tracker limited to previous BRS "Less: Cheques deposited but not Credited" rows.
 
         # Sort by book date so the tracker reads chronologically, oldest first
         _pt_rows.sort(key=lambda row: row[0] or "")
@@ -4917,7 +4881,7 @@ def process_qr_files(
     # Add Matched-sheet transactions in the Cheque Deposit display format.
     # This is display-only: it does not affect matching or BRS arithmetic.
     # Keep a Cheque Deposit-specific append row; r is reused by other sheets.
-    _cheque_append_row = ws.max_row
+    _cheque_append_row = ws.max_row + (1 if _has_pending_settlement_tracker else 0)
     for _src in ws3.iter_rows(min_row=3, values_only=True):
         _method = _src[0] if len(_src) > 0 else ""
         _book_date = _src[4] if len(_src) > 4 else ""
@@ -4936,6 +4900,13 @@ def process_qr_files(
         _pay_type = _src[17] if len(_src) > 17 else ""
         _diff = _src[18] if len(_src) > 18 and _src[18] not in (None, "") else None
         _flags = str(_src[19] if len(_src) > 19 and _src[19] else "").strip()
+        _flags_upper = _flags.upper()
+        if _has_pending_settlement_tracker and (
+            "PREVIOUS DNC CLEARED" in _flags_upper
+            or "PREVIOUS BRS DNC/CNB PAIR CLEARED" in _flags_upper
+            or "CLEARED VS PREV BRS CNB" in _flags_upper
+        ):
+            continue
 
         _display_key = _cheque_display_key(
             _book_date, _book_branch, _book_bill, _book_party, _book_amt
