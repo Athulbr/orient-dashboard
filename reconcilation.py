@@ -9280,10 +9280,22 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
     _title(ws3, len(H3), f"BANK - Matched: Book vs Statement  |  {title_suffix}")
     _hdr(ws3, 2, H3)
     _PP = _NO_FILL
+
+    def _display_or_base(row, display_key, base_key):
+        value = row.get(display_key, None)
+        if value is None:
+            return row.get(base_key, "")
+        try:
+            if pd.isna(value):
+                return row.get(base_key, "")
+        except (TypeError, ValueError):
+            pass
+        return value
+
     for i, (_, r) in enumerate(matched.iterrows(), 3):
         nm        = r["Name Match"]
         am        = r["Amount Match"]
-        diff      = r.get("_display_difference", r["Difference (Rs)"])
+        diff      = _display_or_base(r, "_display_difference", "Difference (Rs)")
         diff_num  = 0.0 if diff == "" else float(diff or 0)
         is_pp     = bool(r.get("Partial Payment", False))
         nf   = _G  if nm == "Match"  else (_Y if "Partial" in nm else _R)
@@ -9296,7 +9308,9 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
                 r["Book Direction"], r["Book Amt (Rs)"],
                 r["Bank Date"], r["Bank Chq"], r["Bank Description"], r["Bank Party"],
                 r["Bank Direction"],
-                r.get("_display_debit", r["Debit (Rs)"]), r.get("_display_credit", r["Credit (Rs)"]), r.get("_display_bank_amt", r["Bank Amt (Rs)"]),
+                _display_or_base(r, "_display_debit", "Debit (Rs)"),
+                _display_or_base(r, "_display_credit", "Credit (Rs)"),
+                _display_or_base(r, "_display_bank_amt", "Bank Amt (Rs)"),
                 diff, pp_label, r["Flags"]]
         fills = [_W, nf, nf, af,
                  _W, _GR, _W, _W, nf, _W, _G,
@@ -9329,7 +9343,7 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
             row_no = section_row + offset
             nm        = r["Name Match"]
             am        = r["Amount Match"]
-            diff      = r.get("_display_difference", r["Difference (Rs)"])
+            diff      = _display_or_base(r, "_display_difference", "Difference (Rs)")
             diff_num  = 0.0 if diff == "" else float(diff or 0)
             is_pp     = bool(r.get("Partial Payment", False))
             nf   = _G  if nm == "Match"  else (_Y if "Partial" in nm else _R)
@@ -9339,7 +9353,7 @@ def build_excel(book_df, stmt_df, matched, book_only, stmt_only,
             pp_label = "YES -- verify" if is_pp else ""
             vals = [r["Match Method"], r["Name Match"], r["Fuzzy Score %"], r["Amount Match"],
                     r.get("Book Date", ""), r["Book Txn"], r["Book Bill No"], r["Book Chq"], r["Book Party"],
-                    r["Book Direction"], r.get("_display_book_amt", r["Book Amt (Rs)"]),
+                    r["Book Direction"], _display_or_base(r, "_display_book_amt", "Book Amt (Rs)"),
                     r["Bank Date"], r["Bank Chq"], r["Bank Description"], r["Bank Party"],
                     r["Bank Direction"],
                     r.get("_display_debit", r["Debit (Rs)"]),
@@ -11601,5 +11615,6 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             process_files(args.book_file, sf, bank_output, args.prev_brs)
         print(f"\nAll {len(stmt_files)} banks processed.")
+
 
 
