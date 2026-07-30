@@ -1,4 +1,5 @@
 import os, re, subprocess, sys
+import warnings
 import pandas as pd
 from datetime import datetime, date as dt_date
 from difflib import SequenceMatcher
@@ -9,6 +10,13 @@ from openpyxl.utils import get_column_letter
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
+
+warnings.filterwarnings(
+    "ignore",
+    message="Workbook contains no default style, apply openpyxl's default",
+    category=UserWarning,
+    module="openpyxl.styles.stylesheet",
+)
 
 # -- CONFIG -------------------------------------------------------------------
 OUTPUT_FILE        = "Bank_Reconciliation.xlsx"
@@ -148,13 +156,15 @@ def extract_brs_date(prev_brs_path):
 def detect_book_sheet(path):
     if path.lower().endswith(".xls"):
         try:
-            pd.ExcelFile(path)
+            with _quiet_legacy_xls_reader(path):
+                pd.ExcelFile(path)
         except ImportError:
             converted = _xls_to_xlsx_via_libreoffice(os.path.abspath(path))
             if converted:
                 path = converted
     try:
-        xl     = pd.ExcelFile(path)
+        with _quiet_legacy_xls_reader(path):
+            xl     = pd.ExcelFile(path)
         sheets = xl.sheet_names
     except Exception:
         return None
@@ -176,7 +186,8 @@ def detect_book_sheet(path):
         if sheet.strip().lower() in BRS_OUTPUT_SHEETS:
             continue
         try:
-            sample = pd.read_excel(path, sheet_name=sheet, header=None, nrows=20)
+            with _quiet_legacy_xls_reader(path):
+                sample = pd.read_excel(path, sheet_name=sheet, header=None, nrows=20)
             text   = " ".join(
                 str(v).lower()
                 for row in sample.values
@@ -192,7 +203,8 @@ def detect_book_sheet(path):
     # Fall back to full scan including all sheets
     for sheet in sheets:
         try:
-            sample = pd.read_excel(path, sheet_name=sheet, header=None, nrows=20)
+            with _quiet_legacy_xls_reader(path):
+                sample = pd.read_excel(path, sheet_name=sheet, header=None, nrows=20)
             text   = " ".join(
                 str(v).lower()
                 for row in sample.values
@@ -206,7 +218,8 @@ def detect_book_sheet(path):
         except Exception:
             continue
     try:
-        xl = pd.ExcelFile(path)
+        with _quiet_legacy_xls_reader(path):
+            xl = pd.ExcelFile(path)
         print(f"[Book] Could not auto-detect sheet - using first sheet: '{xl.sheet_names[0]}'")
         return xl.sheet_names[0]
     except Exception:
@@ -1112,6 +1125,16 @@ def to_signed_amt(v):
     except Exception:
         return 0.0
 
+
+def _clean_note_text(value):
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    text = str(value or "").strip()
+    return "" if text.lower() == "nan" else text
+
 # FIX 4: extract_party_from_desc - improved TRF/ pattern to skip leading
 # numeric-only segments (e.g. "003") and correctly extract the party name.
 # Old pattern:  r"TRF/[^/]+/([^/]+)/"  -> captured "003" for "TRF/003/PARTY/transfer"
@@ -1409,6 +1432,18 @@ def _xls_to_xlsx_via_libreoffice(xls_path):
     return None
 
 
+def _quiet_legacy_xls_reader(path):
+    from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+    import io
+
+    @contextmanager
+    def _quiet():
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            yield
+
+    return _quiet() if str(path).lower().endswith(".xls") else nullcontext()
+
+
 def safe_read_excel(path, **kwargs):
     abspath  = os.path.abspath(path)
     dirname  = os.path.dirname(abspath)
@@ -1417,7 +1452,8 @@ def safe_read_excel(path, **kwargs):
 
     if ext == ".xls":
         try:
-            return pd.read_excel(path, engine="xlrd", **kwargs)
+            with _quiet_legacy_xls_reader(path):
+                return pd.read_excel(path, engine="xlrd", **kwargs)
         except ImportError:
             converted = _xls_to_xlsx_via_libreoffice(abspath)
             if converted:
@@ -1443,7 +1479,8 @@ def safe_read_excel(path, **kwargs):
                 pass
         if ext == ".xls":
             try:
-                return pd.read_excel(path, engine="xlrd", **kwargs)
+                with _quiet_legacy_xls_reader(path):
+                    return pd.read_excel(path, engine="xlrd", **kwargs)
             except Exception:
                 pass
         raise
@@ -1940,7 +1977,32 @@ def parse_previous_brs(path, bank_id=None):
 def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name,
                   book_opening_bal=None):
     stmt = stmt_df.copy()
-    stmt["_used_cf"] = False
+    stmt["_used_cf"] = True
+
+    def _stmt_availability_key(row):
+        return (
+            str(row.get("Date", "")).strip(),
+            str(row.get("Chq No", "")).strip(),
+            str(row.get("Description", "")).strip(),
+            str(row.get("Party", "")).strip().upper(),
+            str(row.get("Direction", "")).strip().upper(),
+            round(float(row.get("Bank Amt (Rs)", 0) or 0), 2),
+        )
+
+    # Previous-BRS clearing may only consume current bank rows that survived the
+    # normal current-period reconciliation. Otherwise the same bank transaction
+    # can be matched once in the current period and then again as a backdated
+    # clear from the previous BRS.
+    _available_stmt_counts = {}
+    if stmt_only is not None and not stmt_only.empty:
+        for _, _sr_avail in stmt_only.iterrows():
+            _key_avail = _stmt_availability_key(_sr_avail)
+            _available_stmt_counts[_key_avail] = _available_stmt_counts.get(_key_avail, 0) + 1
+    for _si_avail, _sr_full in stmt.iterrows():
+        _key_avail = _stmt_availability_key(_sr_full)
+        if _available_stmt_counts.get(_key_avail, 0) > 0:
+            stmt.at[_si_avail, "_used_cf"] = False
+            _available_stmt_counts[_key_avail] -= 1
 
     def _norm_chq(c):
         s = str(c or "").strip().replace(".0", "")
@@ -7119,9 +7181,17 @@ def build_brs_sheet(wb, book_only, stmt_only,
         if isinstance(value, (int, float)):
             cell.number_format = fmt
 
+    def _clean_note_text(value):
+        try:
+            if pd.isna(value):
+                return ""
+        except Exception:
+            pass
+        text = str(value or "").strip()
+        return "" if text.lower() == "nan" else text
+
     def set_narration(row, col, value, fill, font=None):
-        if str(value).strip().lower() == "nan":
-            value = ""
+        value = _clean_note_text(value)
         cell           = ws.cell(row, col)
         cell.value     = value
         cell.fill      = fill
@@ -7247,7 +7317,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
         #   - "CF | " prefix
         # Keep only: name-verify flags ("Name XX% -- verify") and genuine
         # narrations that originated from the book or bank statement files.
-        raw_narr = narration
+        raw_narr = _clean_note_text(narration)
         raw_narr = raw_narr.replace("[CF from prev BRS]", "").strip(" |")
         raw_narr = re.sub(r"^\[HOT Transfer\]\s*", "", raw_narr).strip()
         raw_narr = re.sub(r"^CF\s*\|\s*", "", raw_narr, flags=re.IGNORECASE).strip()
@@ -7375,9 +7445,9 @@ def build_brs_sheet(wb, book_only, stmt_only,
             return False
 
     def _cf_bank_narration(row_data):
-        desc = str(row_data.get("Description", "") or "").strip()
-        party = str(row_data.get("Party", "") or "").strip()
-        narr = str(row_data.get("Narration", "") or "").strip()
+        desc = _clean_note_text(row_data.get("Description", ""))
+        party = _clean_note_text(row_data.get("Party", ""))
+        narr = _clean_note_text(row_data.get("Narration", ""))
         if not narr:
             return ""
         if narr.upper() in {desc.upper(), party.upper()}:
@@ -7432,7 +7502,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
     def _append_display_note(df, idx, note):
         if "Narration" not in df.columns:
             df["Narration"] = ""
-        old = str(df.at[idx, "Narration"] or "").strip()
+        old = _clean_note_text(df.at[idx, "Narration"])
         if note.lower() in old.lower():
             return
         df.at[idx, "Narration"] = f"{old} | {note}".strip(" |") if old else note
@@ -7806,7 +7876,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
                 continue
             _shown_keys.add(_key)
             _amt   = round(float(_br.get("Book Amt (Rs)", 0) or 0), 2)
-            _narr  = str(_br.get("Narration", "") or "").replace("[CF from prev BRS]", "").strip(" |")
+            _narr  = _clean_note_text(_br.get("Narration", "")).replace("[CF from prev BRS]", "").strip(" |")
             _score = _get_4b_score(_cl, _br)
             # Append name-mismatch flag same style as regular unmatched rows
             _name_note = f"Name {_score}% -- verify"
@@ -7903,7 +7973,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             narr = _cf_bank_narration(row_data) if cf else ""
             # For hard-mismatch released rows, Narration carries the flags
             if not narr:
-                _row_narr = str(row_data.get("Narration", "") or "").strip()
+                _row_narr = _clean_note_text(row_data.get("Narration", ""))
                 if _row_narr and _row_narr.upper() not in (desc.upper(), str(row_data.get("Party","")).upper()):
                     narr = _row_narr
             rejected = is_rejected_cheque_record(row_data)
@@ -7978,9 +8048,36 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _sc = _get_4b_score(_cl)
             if _sc >= PARTY_CONFIRMATION_THRESHOLD:
                 continue
-            # Bank entry was consumed - show it here using the stmt row details
+            # Bank entry was consumed - show it here using the stmt row details,
+            # unless the same bank row is already visible in stmt_only after a
+            # low-confidence match release.  Showing both creates a duplicate BRS
+            # row and double-counts the display subtotal.
             _sr_list = _cl.get("cleared_by_stmt_rows", []) or []
             for _sr in _sr_list:
+                _sr_key = (
+                    str(_sr.get("Date", "")).strip(),
+                    str(_sr.get("Chq No", "")).strip(),
+                    str(_sr.get("Description", "")).strip(),
+                    str(_sr.get("Party", "")).strip().upper(),
+                    str(_sr.get("Direction", "")).strip().upper(),
+                    round(float(_sr.get("Bank Amt (Rs)", _cl.get("amount", 0)) or 0), 2),
+                )
+                _already_visible = False
+                if stmt_only is not None and not stmt_only.empty:
+                    for _, _visible_sr in stmt_only.iterrows():
+                        _visible_key = (
+                            str(_visible_sr.get("Date", "")).strip(),
+                            str(_visible_sr.get("Chq No", "")).strip(),
+                            str(_visible_sr.get("Description", "")).strip(),
+                            str(_visible_sr.get("Party", "")).strip().upper(),
+                            str(_visible_sr.get("Direction", "")).strip().upper(),
+                            round(float(_visible_sr.get("Bank Amt (Rs)", 0) or 0), 2),
+                        )
+                        if _visible_key == _sr_key:
+                            _already_visible = True
+                            break
+                if _already_visible:
+                    continue
                 # Build a synthetic entry mimicking the bank row
                 _backdated_cnb.append({
                     **_cl,
@@ -8003,7 +8100,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             # For hard-mismatch released rows, Narration carries the flags from
             # the matched row (e.g. "Name 45% -- verify") - use it directly
             if not narr:
-                _row_narr = str(row_data.get("Narration", "") or "").strip()
+                _row_narr = _clean_note_text(row_data.get("Narration", ""))
                 if _row_narr:
                     narr = _row_narr
             # Also inject name-mismatch flag for low-score 4B cleared entries
@@ -8079,7 +8176,7 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _desc  = str(_cl.get("_display_desc",   _cl.get("description", _cl.get("party_raw", _cl.get("party", "")))))
             _date  = str(_cl.get("_display_date",   _cl.get("date", "")))
             _chq   = str(_cl.get("_display_chq",    _cl.get("chq_no", "")))
-            _narr  = str(_cl.get("narration", "") or "").replace("[CF from prev BRS]", "").strip(" |")
+            _narr  = _clean_note_text(_cl.get("narration", "")).replace("[CF from prev BRS]", "").strip(" |")
             _score = int(_cl.get("_display_score", _get_4b_score(_cl)) or 0)
             _name_note = f"Name {_score}% -- verify"
             _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
@@ -10521,9 +10618,10 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
     if _sbi_fix_applied:
         print("[Process] SBI rectification applied before final BRS build.")
 
-    # General post-carry-forward correction: if the only remaining BRS difference
-    # is one previous "credited_not_book" item that is still present in stmt_only,
-    # treat it as absorbed by current book balances and remove that bank-only leg.
+    # General post-carry-forward correction: if a previous "credited_not_book"
+    # item is still duplicated in stmt_only, remove only the confirmed duplicate
+    # bank leg.  The residual need not equal that item exactly; there may be a
+    # separate genuine current difference that must remain visible.
     if prev_brs and not stmt_only.empty:
         _issued_g      = float(book_only["Book Amt (Rs)"][book_only["Direction"] == "OUTFLOW"].sum()) if not book_only.empty else 0.0
         _deposited_g   = float(book_only["Book Amt (Rs)"][book_only["Direction"] == "INFLOW"].sum())  if not book_only.empty else 0.0
@@ -10532,47 +10630,53 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
         _reconciled_g  = book_closing_bal + _issued_g - _deposited_g - _debited_g + _credited_g
         _brs_diff_g    = round(bank_closing_bal - _reconciled_g, 2)
         _abs_diff_g    = round(abs(_brs_diff_g), 2)
-        _matching_cf_items = [
-            item for item in prev_brs.get("credited_not_book", [])
-            if abs(round(float(item.get("amount", 0) or 0), 2) - _abs_diff_g) < 0.01
-        ]
-        if _brs_diff_g < -0.01 and len(_matching_cf_items) == 1:
-            _cf_item = _matching_cf_items[0]
-            _candidates = stmt_only[
-                (stmt_only["Direction"] == "INFLOW") &
-                (abs(stmt_only["Bank Amt (Rs)"] - _abs_diff_g) < 0.01)
-            ]
-            _matched_idx = None
-            for _idx, _row in _candidates.iterrows():
-                _party_ok = fuzzy(str(_cf_item.get("party", "")), str(_row.get("Party", ""))) >= FUZZY_THRESHOLD
-                _cf_narr = str(_cf_item.get("narration", "")).strip().upper()
-                _desc_ok = bool(_cf_narr and _cf_narr in str(_row.get("Description", "")).strip().upper())
-                if _party_ok or _desc_ok:
-                    _matched_idx = _idx
-                    break
-            if _matched_idx is not None:
-                _row = stmt_only.loc[_matched_idx]
-                print(f"[BRS Correction] Residual diff Rs{_brs_diff_g:+,.2f} "
-                      f"matches previous credited_not_book '{_cf_item.get('party','')}' "
-                      f"Rs{_abs_diff_g:,.2f}; removing duplicate bank-only leg.")
-                cleared_log.append({
-                    "section":   "credited_not_book",
-                    "party":     str(_row.get("Party", "")),
-                    "chq_no":    str(_row.get("Chq No", "")),
-                    "bill_no":   "",
-                    "amount":    float(_row.get("Bank Amt (Rs)", 0)),
-                    "narration": str(_row.get("Description", "")),
-                    "status":    "CLEARED (absorbed in current book balance)",
-                })
-                carryforward_log = [
-                    item for item in carryforward_log
-                    if not (
-                        item.get("section") == "credited_not_book" and
-                        abs(float(item.get("amount", 0) or 0) - _abs_diff_g) < 0.01 and
-                        fuzzy(str(item.get("party", "")), str(_cf_item.get("party", ""))) >= FUZZY_THRESHOLD
-                    )
+        _best_abs_after = _abs_diff_g
+        _best_duplicate = None
+
+        if _brs_diff_g < -0.01:
+            for _cf_item in prev_brs.get("credited_not_book", []):
+                _cf_amt = round(float(_cf_item.get("amount", 0) or 0), 2)
+                if _cf_amt <= 0 or _cf_amt > _abs_diff_g + 0.01:
+                    continue
+                _candidates = stmt_only[
+                    (stmt_only["Direction"] == "INFLOW") &
+                    (abs(stmt_only["Bank Amt (Rs)"] - _cf_amt) < 0.01)
                 ]
-                stmt_only = stmt_only.drop(index=_matched_idx)
+                for _idx, _row in _candidates.iterrows():
+                    _party_ok = fuzzy(str(_cf_item.get("party", "")), str(_row.get("Party", ""))) >= FUZZY_THRESHOLD
+                    _cf_narr = str(_cf_item.get("narration", "")).strip().upper()
+                    _desc_ok = bool(_cf_narr and _cf_narr in str(_row.get("Description", "")).strip().upper())
+                    if not (_party_ok or _desc_ok):
+                        continue
+                    _after = round(_brs_diff_g + _cf_amt, 2)
+                    _abs_after = abs(_after)
+                    if _abs_after + 0.01 < _best_abs_after:
+                        _best_abs_after = _abs_after
+                        _best_duplicate = (_idx, _row, _cf_item, _cf_amt, _after)
+
+        if _best_duplicate is not None:
+            _matched_idx, _row, _cf_item, _cf_amt, _after_diff = _best_duplicate
+            print(f"[BRS Correction] Residual diff Rs{_brs_diff_g:+,.2f} includes previous "
+                  f"credited_not_book '{_cf_item.get('party','')}' Rs{_cf_amt:,.2f}; "
+                  f"removing duplicate bank-only leg leaves Rs{_after_diff:+,.2f}.")
+            cleared_log.append({
+                "section":   "credited_not_book",
+                "party":     str(_row.get("Party", "")),
+                "chq_no":    str(_row.get("Chq No", "")),
+                "bill_no":   "",
+                "amount":    float(_row.get("Bank Amt (Rs)", 0)),
+                "narration": str(_row.get("Description", "")),
+                "status":    "CLEARED (absorbed in current book balance)",
+            })
+            carryforward_log = [
+                item for item in carryforward_log
+                if not (
+                    item.get("section") == "credited_not_book" and
+                    abs(float(item.get("amount", 0) or 0) - _cf_amt) < 0.01 and
+                    fuzzy(str(item.get("party", "")), str(_cf_item.get("party", ""))) >= FUZZY_THRESHOLD
+                )
+            ]
+            stmt_only = stmt_only.drop(index=_matched_idx)
 
     # Symmetric correction for previous "issued_not_debited" items absorbed into
     # the current book opening. If the residual difference exactly matches one
@@ -10709,17 +10813,22 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
                     "Balance (Rs)":  "",
                     "Narration":     _synth_narr,
                 }
-                stmt_only = pd.concat(
-                    [stmt_only, pd.DataFrame([_synthetic_row])], ignore_index=True
-                )
-                carryforward_log.append({
-                    **_ind_item,
-                    "section": "debited_not_book",
-                    "status":  "CARRIED FORWARD (name difference - synthetic entry)",
-                })
-                print(f"[BRS Correction] Added synthetic debited_not_book row for "
-                      f"'{_ind_item.get('party','')}' chq={_ind_chq} "
-                      f"Rs{_abs_diff_g:,.2f} - name difference, closes BRS diff.")
+                if _bank_desc_from_prev or _bank_desc_from_block:
+                    stmt_only = pd.concat(
+                        [stmt_only, pd.DataFrame([_synthetic_row])], ignore_index=True
+                    )
+                    carryforward_log.append({
+                        **_ind_item,
+                        "section": "debited_not_book",
+                        "status":  "CARRIED FORWARD (name difference - synthetic entry)",
+                    })
+                    print(f"[BRS Correction] Added synthetic debited_not_book row for "
+                          f"'{_ind_item.get('party','')}' chq={_ind_chq} "
+                          f"Rs{_abs_diff_g:,.2f} - name difference, closes BRS diff.")
+                else:
+                    print(f"[BRS Correction] Not adding synthetic debited_not_book for "
+                          f"'{_ind_item.get('party','')}' Rs{_abs_diff_g:,.2f}: "
+                          f"no bank-side debit evidence found; leaving BRS difference visible.")
             else:
                 _candidates = book_only[
                     (book_only["Direction"] == "OUTFLOW") &
@@ -11493,7 +11602,7 @@ def process_files(book_path, stmt_path, output_path, prev_brs_path=None):
             }
 
         def _append_brs_note(df, idx, note):
-            old = str(df.at[idx, "Narration"] or "").strip()
+            old = _clean_note_text(df.at[idx, "Narration"])
             if note.lower() in old.lower():
                 return
             df.at[idx, "Narration"] = f"{old} | {note}".strip(" |") if old else note
@@ -11615,6 +11724,5 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             process_files(args.book_file, sf, bank_output, args.prev_brs)
         print(f"\nAll {len(stmt_files)} banks processed.")
-
 
 
