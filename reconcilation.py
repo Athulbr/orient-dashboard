@@ -7877,10 +7877,15 @@ def build_brs_sheet(wb, book_only, stmt_only,
             _shown_keys.add(_key)
             _amt   = round(float(_br.get("Book Amt (Rs)", 0) or 0), 2)
             _narr  = _clean_note_text(_br.get("Narration", "")).replace("[CF from prev BRS]", "").strip(" |")
-            _score = _get_4b_score(_cl, _br)
-            # Append name-mismatch flag same style as regular unmatched rows
-            _name_note = f"Name {_score}% -- verify"
-            _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
+            if str(_cl.get("section", "")) == "deposited_not_credited":
+                _score = _get_4b_score(_cl)
+            else:
+                _score = _get_4b_score(_cl, _br)
+            # Append name-mismatch flag only when the same score that caused the
+            # BRS review row is actually below the manual-confirmation threshold.
+            if _score < PARTY_CONFIRMATION_THRESHOLD:
+                _name_note = f"Name {_score}% -- verify"
+                _narr = (_narr + " | " + _name_note).strip(" |") if _narr else _name_note
             _txn   = str(_br.get("Txn Type", ""))
             _bill  = str(_br.get("Bill No", ""))
             _chq   = str(_br.get("Chq No", ""))
