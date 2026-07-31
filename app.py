@@ -667,6 +667,9 @@ async def reconcile_gateway_endpoint(
     cashfree_files:    list[UploadFile] = File(default=[], description="CashFree (.xlsx) — 0 to 4 files"),
     easebuzz_files:    list[UploadFile] = File(default=[], description="EaseBuzz (.csv) — 0 to 4 files"),
     previous_brs_file: UploadFile = File(..., description="Previous day BRS workbook (.xlsx)"),
+    name_match_direct_file: UploadFile = File(..., description="Name Matching Report - Direct payment workbook (.xlsx)"),
+    name_match_file:        UploadFile = File(..., description="Name Matching Report workbook (.xlsx)"),
+    total_orders_file:      UploadFile = File(..., description="Total Orders List workbook (.xlsx)"),
 ):
     # Validate file extensions
     for f in [all_branches_file, hot_book_file]:
@@ -679,6 +682,9 @@ async def reconcile_gateway_endpoint(
             raise HTTPException(status_code=400,
                 detail=f"EaseBuzz file '{f.filename}' must be .csv or .xlsx")
     _validate_filename(previous_brs_file.filename)
+    _validate_filename(name_match_direct_file.filename)
+    _validate_filename(name_match_file.filename)
+    _validate_filename(total_orders_file.filename)
 
     tmpdir    = tempfile.mkdtemp()
     file_data = None
@@ -718,6 +724,15 @@ async def reconcile_gateway_endpoint(
 
         prev_brs_path = os.path.join(tmpdir, previous_brs_file.filename)
         with open(prev_brs_path, "wb") as f: f.write(await previous_brs_file.read())
+
+        name_match_direct_path = os.path.join(tmpdir, name_match_direct_file.filename)
+        with open(name_match_direct_path, "wb") as f: f.write(await name_match_direct_file.read())
+
+        name_match_path = os.path.join(tmpdir, name_match_file.filename)
+        with open(name_match_path, "wb") as f: f.write(await name_match_file.read())
+
+        total_orders_path = os.path.join(tmpdir, total_orders_file.filename)
+        with open(total_orders_path, "wb") as f: f.write(await total_orders_file.read())
 
         # Sheet metadata (book files only — PDF has no sheets)
         all_branches_sheets = get_sheet_metadata(all_branches_path)
@@ -765,6 +780,9 @@ async def reconcile_gateway_endpoint(
             cashfree_path     = cashfree_paths,
             easebuzz_paths    = easebuzz_paths,
             prev_brs_path     = prev_brs_path,
+            name_match_direct_path = name_match_direct_path,
+            name_match_path        = name_match_path,
+            total_orders_path      = total_orders_path,
         )
 
         with open(output_path, "rb") as f:
@@ -780,6 +798,9 @@ async def reconcile_gateway_endpoint(
         _gw_inputs += [(p, f"cashfree{i+1}{_ext(p)}") for i, p in enumerate(cashfree_paths)]
         _gw_inputs += [(p, f"easebuzz{i+1}{_ext(p)}") for i, p in enumerate(easebuzz_paths)]
         _gw_inputs.append((prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"))
+        _gw_inputs.append((name_match_direct_path, f"name_match_direct{_ext(name_match_direct_file.filename)}"))
+        _gw_inputs.append((name_match_path,        f"name_match{_ext(name_match_file.filename)}"))
+        _gw_inputs.append((total_orders_path,      f"total_orders{_ext(total_orders_file.filename)}"))
 
         _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_Reconciliation.xlsx")
         
@@ -955,6 +976,9 @@ async def reconcile_gateway_endpoint(
         "statement_file_name": statement_file.filename,
         "payu_files": [f.filename for f in payu_files],
         "previous_brs_file":   previous_brs_file.filename,
+        "name_match_direct_file": name_match_direct_file.filename,
+        "name_match_file":        name_match_file.filename,
+        "total_orders_file":      total_orders_file.filename,
 
         "all_branches_sheets": all_branches_sheets,
         "hot_book_sheets":     hot_book_sheets,
