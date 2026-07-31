@@ -738,7 +738,7 @@ async def reconcile_gateway_endpoint(
         all_branches_sheets = get_sheet_metadata(all_branches_path)
         hot_book_sheets     = get_sheet_metadata(hot_book_path)
 
-        output_path = os.path.join(tmpdir, "Gateway_Reconcilation.xlsx")
+        output_path = os.path.join(tmpdir, "Gateway_BRS.xlsx")
         # Run full Gateway reconciliation
         (gateway_results,
          dnc_all,
@@ -802,7 +802,7 @@ async def reconcile_gateway_endpoint(
         _gw_inputs.append((name_match_path,        f"name_match{_ext(name_match_file.filename)}"))
         _gw_inputs.append((total_orders_path,      f"total_orders{_ext(total_orders_file.filename)}"))
 
-        _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_Reconciliation.xlsx")
+        _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
         
 
 
@@ -1008,7 +1008,7 @@ async def reconcile_gateway_endpoint(
         },
 
         "file_bytes": file_data.hex(),
-        "file_name":  "Gateway_Reconcilation.xlsx",
+        "file_name":  "Gateway_BRS.xlsx",
     }))
 
 
