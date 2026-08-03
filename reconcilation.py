@@ -3565,6 +3565,66 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                   f"party='{item['party']}' amt={item['amount']:,.2f}")
             continue
 
+        def _single_token_party_expansion_needs_review(book_row):
+            cf_clean = clean_name(str(item.get("party", "")))
+            book_clean = clean_name(str(book_row.get("Party", "")))
+            cf_words = [w for w in cf_clean.split() if len(w) >= 3]
+            book_words = [w for w in book_clean.split() if len(w) >= 3]
+            if len(cf_words) != 1 or len(book_words) < 2:
+                return False
+            if cf_clean == book_clean:
+                return False
+            if cf_words[0] not in book_words and cf_clean not in book_clean:
+                return False
+            source_text = clean_name(" ".join(str(item.get(k, "")) for k in ("description", "narration", "party_raw")))
+            book_bill = str(book_row.get("Bill No", "")).strip()
+            compact_book = re.sub(r"[^A-Z0-9]", "", book_clean)
+            compact_source = re.sub(r"[^A-Z0-9]", "", source_text)
+            if book_bill and book_bill in source_text:
+                return False
+            if len(compact_book) >= 8 and compact_book in compact_source:
+                return False
+            return True
+        def _log_weak_cf_cross_match(book_row, source_check):
+            cf_amt = round(float(item.get("amount", 0) or 0), 2)
+            book_amt = round(float(book_row.get("Book Amt (Rs)", 0) or 0), 2)
+            key = (
+                "weak_cf_single_token",
+                str(item.get("section", "credited_not_book")),
+                str(item.get("date", "")).strip(),
+                str(item.get("party", "")).strip().upper(),
+                cf_amt,
+                str(book_row.get("Date", "")).strip(),
+                str(book_row.get("Bill No", "")).strip(),
+                str(book_row.get("Party", "")).strip().upper(),
+                book_amt,
+            )
+            for blk in blocked_crossclears:
+                if blk.get("_review_key") == key:
+                    return
+            score = fuzzy(str(item.get("party", "")), str(book_row.get("Party", "")))
+            blocked_crossclears.append({
+                "review_section": "possible_cross_match",
+                "_review_key": key,
+                "reason": "Weak single-token previous-BRS party expansion; kept in BRS for manual verification",
+                "source_check": source_check,
+                "fuzzy_score": score,
+                "side_a": {
+                    "section": "book_only",
+                    "date": str(book_row.get("Date", "")),
+                    "party": str(book_row.get("Party", "")),
+                    "bill_no": str(book_row.get("Bill No", "")),
+                    "chq_no": str(book_row.get("Chq No", "")),
+                    "amount": book_amt,
+                    "txn_type": str(book_row.get("Txn Type", "")),
+                },
+                "side_b": {
+                    **item,
+                    "section": str(item.get("section", "credited_not_book")),
+                    "amount": cf_amt,
+                },
+            })
+
         def _find_in_book_only(amt, cf_party=""):
             if cf_party:
                 for bo_idx, bo_row in book_only.iterrows():
@@ -3573,6 +3633,9 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                     if bo_row["Direction"] != "INFLOW":
                         continue
                     if abs(float(bo_row["Book Amt (Rs)"]) - amt) >= 0.01:
+                        continue
+                    if _single_token_party_expansion_needs_review(bo_row):
+                        _log_weak_cf_cross_match(bo_row, "FindBookOnly-Fuzzy")
                         continue
                     if fuzzy(cf_party, str(bo_row["Party"])) >= FUZZY_THRESHOLD:
                         return bo_idx
@@ -3586,6 +3649,9 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                         continue
                     if abs(float(bo_row["Book Amt (Rs)"]) - amt) >= 0.01:
                         continue
+                    if _single_token_party_expansion_needs_review(bo_row):
+                        _log_weak_cf_cross_match(bo_row, "FindBookOnly-WordOverlap")
+                        continue
                     bo_words = set(str(bo_row["Party"]).upper().split())
                     if cf_words & bo_words:
                         return bo_idx
@@ -3596,6 +3662,9 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 if bo_row["Direction"] != "INFLOW":
                     continue
                 if abs(float(bo_row["Book Amt (Rs)"]) - amt) < 0.01:
+                    if _single_token_party_expansion_needs_review(bo_row):
+                        _log_weak_cf_cross_match(bo_row, "FindBookOnly-AmountOnly")
+                        continue
                     return bo_idx
 
             return None
@@ -3704,6 +3773,11 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                 continue
             name_ok = (fuzzy(item["party"], br["Party"]) >= FUZZY_THRESHOLD or
                        _truncated_name_match(item["party"], br["Party"]))
+            if name_ok and _single_token_party_expansion_needs_review(br):
+                _log_weak_cf_cross_match(br, "Check1")
+                print(f"[CF] Check1 blocked weak single-token previous-BRS party: "
+                      f"CF={item['party']} Rs{item['amount']:,.2f} <-> book={br['Party']}")
+                name_ok = False
             if not name_ok:
                 continue
             bo_idx_for_br = _find_exact_book_only_row(br)
@@ -3905,6 +3979,33 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
             ]
             cf_amt = float(item["amount"])
             bo_indices = list(bo_inflow.index)
+
+            def _cf_book_split_anchor(idx):
+                """Return (ok, score) for using a book row in a CF split clear.
+
+                Amount-only subsets are unsafe here: many unrelated receipts can
+                coincidentally add up to one previous-BRS bank credit.
+                """
+                _book_party = str(book_only.at[idx, "Party"])
+                _book_text = f"{_book_party} {book_only.at[idx, 'Narration']}"
+                _score = fuzzy(item["party"], _book_party)
+                if _score >= FUZZY_THRESHOLD:
+                    return True, _score
+                if _truncated_name_match(item["party"], _book_party):
+                    return True, _score
+                if _meaningful_words(item["party"]) & _meaningful_words(_book_text):
+                    return True, _score
+                _bill_no = str(book_only.at[idx, "Bill No"]).strip()
+                _cf_narr = str(item.get("narration", "")).upper()
+                if _bill_no and _bill_no in _cf_narr:
+                    return True, _score
+                _cf_compact = re.sub(r"[^A-Z0-9]", "", clean_name(str(item.get("party", ""))))
+                _book_compact = re.sub(r"[^A-Z0-9]", "", clean_name(_book_text))
+                if (len(_cf_compact) >= 7 and len(_book_compact) >= 7 and
+                        (_cf_compact in _book_compact or _book_compact in _cf_compact)):
+                    return True, _score
+                return False, _score
+
             for _ii in range(len(bo_indices)):
                 if already_recorded:
                     break
@@ -3914,9 +4015,9 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
                                     float(book_only.at[bi2, "Book Amt (Rs)"]))
                     if abs(combined_amt - cf_amt) >= 0.01:
                         continue
-                    score1 = fuzzy(item["party"], str(book_only.at[bi1, "Party"]))
-                    score2 = fuzzy(item["party"], str(book_only.at[bi2, "Party"]))
-                    if max(score1, score2) < 30:
+                    anchor1, score1 = _cf_book_split_anchor(bi1)
+                    anchor2, score2 = _cf_book_split_anchor(bi2)
+                    if not (anchor1 and anchor2):
                         continue
                     if (_book_only_row_reserved_for_direct_cf(bi1, item, score1) or
                             _book_only_row_reserved_for_direct_cf(bi2, item, score2)):
@@ -3938,11 +4039,8 @@ def carry_forward(prev_brs, stmt_df, book_only, stmt_only, book_df, company_name
         if not already_recorded:
             split_candidates = []
             for idx in bo_indices:
-                _split_score = fuzzy(item["party"], str(book_only.at[idx, "Party"]))
-                _split_words_ok = bool(_meaningful_words(item["party"]) & _meaningful_words(
-                    f"{book_only.at[idx, 'Party']} {book_only.at[idx, 'Narration']}"
-                ))
-                if _split_score < 30 and not _split_words_ok:
+                _split_anchor_ok, _split_score = _cf_book_split_anchor(idx)
+                if not _split_anchor_ok:
                     continue
                 if _book_only_row_reserved_for_direct_cf(idx, item, _split_score):
                     print(f"[CF] Check4b subset skipped book_only[{idx}]: "
@@ -8635,6 +8733,8 @@ def build_verification_sheet(wb, matched, book_only, stmt_only,
 
     # B1 - Blocked cross-clears (our fixes stopped these from auto-cancelling)
     for blk in blocked_crossclears:
+        if blk.get("review_section") == "possible_cross_match":
+            continue
         ia   = blk.get("side_a", {})
         ib   = blk.get("side_b", {})
         _party_a  = str(ia.get("party", ""))
@@ -9050,9 +9150,14 @@ def build_verification_sheet(wb, matched, book_only, stmt_only,
             _cross_groups = _item["_cross_match_groups"]
             break
 
-    if _cross_groups:
+    _weak_cf_cross_matches = [
+        blk for blk in (blocked_crossclears or [])
+        if isinstance(blk, dict) and blk.get("review_section") == "possible_cross_match"
+    ]
+
+    if _cross_groups or _weak_cf_cross_matches:
         _sec_title(
-            f"SECTION G - Possible Cross-Matches  ({len(_cross_groups)} group(s))"
+            f"SECTION G - Possible Cross-Matches  ({len(_cross_groups) + len(_weak_cf_cross_matches)} group(s))"
             f"  -  Same amount+date matched to different parties - verify correct pairing",
             fill=PatternFill("solid", fgColor="833C00")
         )
@@ -9085,6 +9190,36 @@ def build_verification_sheet(wb, matched, book_only, stmt_only,
                     action,
                 ], fill=_NO_FILL)
                 row += 1
+        for _blk in _weak_cf_cross_matches:
+            _book = _blk.get("side_a", {})
+            _bank = _blk.get("side_b", {})
+            _book_p = str(_book.get("party", ""))
+            _bank_p = str(_bank.get("party", ""))
+            _amt = float(_book.get("amount", _bank.get("amount", 0)) or 0)
+            _score = int(_blk.get("fuzzy_score", 0) or 0)
+            _bank_desc = str(_bank.get("description", _bank.get("party_raw", _bank_p)))
+            issue_desc = (
+                f"Previous-BRS bank credit party is only '{_bank_p}' but current book party is "
+                f"'{_book_p}'. Raw fuzzy score {_score}% is substring-based and is not "
+                f"strong enough for auto-clear without bill/reference/full-name evidence."
+            )
+            action = "Verify identity manually. If same party/payment, clear manually; otherwise keep both in BRS."
+            _flag_row([
+                "Carry-Forward  |  Weak Party Cross-Match",
+                str(_book.get("date", "")),
+                str(_bank.get("date", "")),
+                str(_book.get("bill_no", "")),
+                str(_book.get("chq_no", "")),
+                str(_bank.get("chq_no", "")),
+                _book_p,
+                _bank_desc,
+                _amt,
+                0.00,
+                f"Possible CF Cross-Match - weak party ({_score}%)",
+                issue_desc,
+                action,
+            ], fill=_NO_FILL)
+            row += 1
     else:
         _sec_title("SECTION G - Possible Cross-Matches  -  None found",
                    fill=PatternFill("solid", fgColor="375623"))
@@ -11729,5 +11864,3 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             process_files(args.book_file, sf, bank_output, args.prev_brs)
         print(f"\nAll {len(stmt_files)} banks processed.")
-
-
