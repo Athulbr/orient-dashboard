@@ -1,20 +1,24 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Any, Dict, List
 import os, tempfile, gc, shutil
 import zipfile
 import threading
 from datetime import datetime
 import math
 import numpy as np
+import pandas as pd
 
 from reconcilation import (
     process_files, get_sheet_metadata,
-    parse_book, parse_statement, extract_brs_date, parse_date,
-    detect_book_sheet, safe_read_excel, find_book_bank_id, extract_account_from_book, count_book_transactions_by_bill_no
+    parse_book, parse_statement, parse_previous_brs, extract_brs_date, parse_date,
+    detect_book_sheet, safe_read_excel, find_book_bank_id, extract_account_from_book, count_book_transactions_by_bill_no,
+    build_excel, BOOK_COLS, STMT_COLS,
 )
 from qr_reconcilation import process_qr_files, count_transactions_by_bill_no_and_name
-from gateway_reconcilation import process_gateway_files
+from gateway_reconcilation import process_gateway_files, count_transactions_by_bill_no_and_name as count_gateway_transactions_by_bill_no_and_name
 import requests
 from config import RECONCILIATION_API, TRANSACTIONS_DIR
 
@@ -51,6 +55,13 @@ def _next_transaction_dir(recon_type: str) -> str:
     return txn_dir
 
 def _archive_transaction(recon_type, input_files, output_path, output_name):
+    """Copy inputs + output into the Transactions archive.
+
+    Returns the transaction_ref string (e.g. "03-08-2026/bank/transaction7")
+    identifying where this run was saved, or None if archiving failed. The
+    ref is a relative path under TRANSACTIONS_DIR — it's what a later
+    /workflow/regenerate call uses to find the original input files again.
+    """
     try:
         txn_dir = _next_transaction_dir(recon_type)
         for src_path, save_name in input_files:
@@ -58,8 +69,10 @@ def _archive_transaction(recon_type, input_files, output_path, output_name):
                 shutil.copy2(src_path, os.path.join(txn_dir, save_name))
         if output_path and os.path.exists(output_path):
             shutil.copy2(output_path, os.path.join(txn_dir, output_name))
+        return os.path.relpath(txn_dir, TRANSACTIONS_DIR).replace(os.sep, "/")
     except Exception as e:
         print(f"[archive] Failed to archive {recon_type} transaction: {e}")
+        return None
 
 def _sanitize(obj):
     """Recursively sanitize for JSON — handles numpy/pandas scalar types."""
@@ -192,6 +205,41 @@ def _compute_qr_brs(book_closing_bal, bank_closing_bal, book_only_df, bank_only_
     }
 
 
+# Exact key set produced by reconcilation.py's _make_row() for a "matched" row
+# (and therefore what the frontend receives/echoes back for every matched
+# record). Kept here so a regenerated workbook never hits a KeyError on a
+# column build_excel expects, even if a manually-constructed row omitted one.
+MATCHED_COLS = [
+    "Match Method", "Name Match", "Fuzzy Score %", "Amount Match",
+    "Book Date", "Book Txn", "Book Bill No", "Book Chq", "Book Party", "Book Party Raw",
+    "Book Direction", "Book Sender", "Book Recipient", "Book Amt (Rs)",
+    "Bank Date", "Bank Chq", "Bank Description", "Bank Party",
+    "Bank Direction", "Bank Sender", "Bank Recipient",
+    "Debit (Rs)", "Credit (Rs)", "Bank Amt (Rs)", "Difference (Rs)",
+    "Flags", "Partial Payment", "Bank Full Amt",
+]
+
+
+def _records_to_df(records: List[Dict[str, Any]], required_cols: List[str]) -> pd.DataFrame:
+    """Rebuild a DataFrame from frontend-edited records, guaranteeing every
+    column build_excel() accesses by name exists — including when the list
+    is empty, since build_excel indexes by column even on 0-row frames."""
+    if not records:
+        return pd.DataFrame(columns=required_cols)
+    df = pd.DataFrame(records)
+    for col in required_cols:
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+
+class RegenerateBankRequest(BaseModel):
+    transaction_ref: str
+    matched:   List[Dict[str, Any]]
+    book_only: List[Dict[str, Any]]
+    bank_only: List[Dict[str, Any]]
+
+
 def post_reconciliation(transaction_info):
     try:
         response = requests.post(
@@ -211,7 +259,7 @@ def post_reconciliation(transaction_info):
 # NORMAL BANK RECONCILIATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.post("/workflow/reconcile", summary="Upload book report, bank statement and previous BRS file.")
+@app.post("/reconcile/reconcile-bank", summary="Upload book report, bank statement and previous BRS file.")
 async def reconcile_endpoint(
     book_file:         UploadFile = File(...),
     statement_file:    UploadFile = File(...),
@@ -313,7 +361,7 @@ async def reconcile_endpoint(
         with open(output_path, "rb") as f:
             file_data = f.read()
         
-        _archive_transaction("bank", [
+        transaction_ref = _archive_transaction("bank", [
             (book_path,     f"book_report{_ext(book_file.filename)}"),
             (stmt_path,     f"bank_statement{_ext(statement_file.filename)}"),
             (prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"),
@@ -373,7 +421,158 @@ async def reconcile_endpoint(
         },
 
         "file_bytes": file_data.hex(),
-        "file_name":  "Reconciliation.xlsx"
+        "file_name":  "Reconciliation.xlsx",
+        "transaction_ref": transaction_ref,
+    }))
+
+
+@app.post(
+    "/reconcile/regenerate-bank",
+    summary="Rebuild a reconciliation workbook from in-app edits (un-match / manual match). Bank type only for now.",
+)
+async def regenerate_endpoint(payload: RegenerateBankRequest):
+    ref = (payload.transaction_ref or "").strip("/")
+    parts = ref.split("/")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail=f"Malformed transaction_ref: '{payload.transaction_ref}'")
+    date_folder, recon_type, txn_name = parts
+
+    if recon_type != "bank":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Regenerate is only supported for 'bank' reconciliations right now "
+                f"(this transaction is '{recon_type}')."
+            ),
+        )
+
+    txn_dir = os.path.join(TRANSACTIONS_DIR, date_folder, recon_type, txn_name)
+    if not os.path.isdir(txn_dir):
+        raise HTTPException(status_code=404, detail=f"Transaction not found: '{ref}'")
+
+    def _find_archived(prefix):
+        for fname in sorted(os.listdir(txn_dir)):
+            if fname.startswith(prefix):
+                return os.path.join(txn_dir, fname)
+        return None
+
+    book_path     = _find_archived("book_report")
+    stmt_path     = _find_archived("bank_statement")
+    prev_brs_path = _find_archived("previous_brs")
+    if not book_path or not stmt_path:
+        raise HTTPException(status_code=404, detail=f"Original input files missing for transaction '{ref}'.")
+    # The upload form archives an empty placeholder file when no previous BRS
+    # was supplied — treat a 0-byte file the same as "not supplied".
+    if prev_brs_path and os.path.getsize(prev_brs_path) == 0:
+        prev_brs_path = None
+
+    out_tmpdir = tempfile.mkdtemp()
+    try:
+        # Re-derive everything that is NOT user-editable — the raw ledger/
+        # statement rows, opening & closing balances, company/account/branch
+        # labels, BRS date — via the exact same parsing the original run
+        # used, so these stay identical to the original workbook. Only
+        # matched / book_only / bank_only are replaced with the frontend's
+        # edited tables below.
+        stmt_result         = parse_statement(stmt_path)
+        raw_stmt_df         = stmt_result[0]
+        bank_closing_bal    = stmt_result[1]
+        account_no          = stmt_result[2]
+        branch_label        = stmt_result[3]
+        bank_name_hint      = stmt_result[4]
+        is_no_transactions  = stmt_result[5]
+
+        _sheet = detect_book_sheet(book_path)
+        _raw   = safe_read_excel(book_path, sheet_name=_sheet, header=None)
+        target_bank_id = None
+        if bank_name_hint and bank_name_hint != "UNKNOWN":
+            target_bank_id = find_book_bank_id(_raw, bank_name_hint)
+
+        book_result        = parse_book(book_path, target_bank_id=target_bank_id)
+        book_df            = book_result[0]
+        book_opening_bal   = book_result[1]
+        book_opening_drcr  = book_result[2]
+        book_closing_bal   = book_result[3]
+        book_closing_drcr  = book_result[4]
+        company_name       = book_result[5]
+        bank_id            = book_result[6]
+
+        if account_no == "ACCOUNT NO NOT FOUND" and bank_name_hint and bank_name_hint != "UNKNOWN":
+            acc_from_book = extract_account_from_book(book_path, bank_name_hint)
+            if acc_from_book:
+                account_no = acc_from_book
+
+        brs_date = extract_brs_date(prev_brs_path) if prev_brs_path else \
+            "DATE NOT PROVIDED - please include previous BRS file"
+        title_date = brs_date
+        if not book_df.empty and "Date" in book_df.columns:
+            _valid_dates = [parse_date(d) for d in book_df["Date"]
+                             if d and str(d).strip() not in ("", "nan")]
+            _valid_dates = [d for d in _valid_dates if d is not None]
+            if _valid_dates:
+                title_date = max(_valid_dates).strftime("%d-%m-%Y")
+
+        if is_no_transactions and bank_closing_bal == 0.0 and prev_brs_path:
+            _prev = parse_previous_brs(prev_brs_path, bank_id=bank_id)
+            prev_bank_bal = _prev.get("prev_bank_closing_bal", 0.0)
+            bank_closing_bal = prev_bank_bal if prev_bank_bal != 0.0 else book_closing_bal
+
+        # Rebuild the three editable tables from what the user has in the app.
+        matched_df   = _records_to_df(payload.matched,   MATCHED_COLS)
+        book_only_df = _records_to_df(payload.book_only, BOOK_COLS)
+        stmt_only_df = _records_to_df(payload.bank_only, STMT_COLS)
+
+        output_path = os.path.join(out_tmpdir, "Reconciliation.xlsx")
+        build_excel(
+            book_df, raw_stmt_df, matched_df, book_only_df, stmt_only_df,
+            book_opening_bal, book_opening_drcr,
+            book_closing_bal, book_closing_drcr,
+            bank_closing_bal, output_path,
+            company_name=company_name,
+            account_no=account_no,
+            branch_label=branch_label,
+            brs_date=title_date,
+        )
+
+        with open(output_path, "rb") as f:
+            file_data = f.read()
+
+        # Per product decision: downloading after edits becomes the new
+        # permanent record for this transaction — overwrite the archive.
+        shutil.copy2(output_path, os.path.join(txn_dir, "Reconciliation.xlsx"))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate workbook: {e}")
+    finally:
+        gc.collect()
+        shutil.rmtree(out_tmpdir, ignore_errors=True)
+
+    brs = _compute_brs(book_closing_bal, bank_closing_bal, book_only_df, stmt_only_df)
+
+    matched_perfect = matched_with_diff = 0
+    if not matched_df.empty:
+        matched_perfect   = int(((matched_df["Name Match"] == "Match") & (matched_df["Amount Match"] == "Exact")).sum())
+        matched_with_diff = int((matched_df["Amount Match"].astype(str) != "Exact").sum())
+
+    return JSONResponse(_sanitize({
+        "status":          "success",
+        "recon_type":      "bank",
+        "transaction_ref": ref,
+        "brs":             brs,
+        "summary": {
+            "book_entries":      len(book_df),
+            "bank_entries":      len(raw_stmt_df),
+            "matched":           len(matched_df),
+            "matched_perfect":   matched_perfect,
+            "matched_with_diff": matched_with_diff,
+            "book_only":         len(book_only_df),
+            "bank_only":         len(stmt_only_df),
+            "difference":        brs["brs_difference"],
+        },
+        "file_bytes": file_data.hex(),
+        "file_name":  "Reconciliation.xlsx",
     }))
 
 
@@ -382,7 +581,7 @@ async def reconcile_endpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
-    "/workflow/reconcile-qr",
+    "/reconcile/reconcile-qr",
     summary="QR reconciliation — 4 files: All-Branches book, HOT QRHDFC book, QR gateway statement, Previous BRS.",
 )
 async def reconcile_qr_endpoint(
@@ -456,7 +655,7 @@ async def reconcile_qr_endpoint(
         with open(output_path, "rb") as f:
             file_data = f.read()
         
-        _archive_transaction("qr", [
+        transaction_ref = _archive_transaction("qr", [
             (all_branches_path, f"all_branches{_ext(all_branches_file.filename)}"),
             (hot_book_path,     f"hot_book{_ext(hot_book_file.filename)}"),
             (stmt_path,         f"qr_statement{_ext(statement_file.filename)}"),
@@ -642,6 +841,171 @@ async def reconcile_qr_endpoint(
  
         "file_bytes": file_data.hex(),
         "file_name":  "QR_Reconciliation.xlsx",
+        "transaction_ref": transaction_ref,
+    }))
+
+
+# ── QR field-translation helpers ─────────────────────────────────────────────
+# The frontend receives normalized, capitalized field names (built above, in
+# this same endpoint). qr_reconcilation.py's own internals — the dnc_all /
+# cnb_all / matched_rows lists the override mechanism substitutes — use a
+# different, lowercase raw shape. These convert an edited session back into
+# that raw shape. Some fields (original note/remark split, book/bank branch
+# on matched rows, RRN-vs-chq nuances) can't be perfectly reconstructed from
+# the normalized JSON alone — this is a best-effort, display-accurate
+# reconstruction, not a byte-for-byte reversal of the original internal dict.
+
+def _qr_records_to_dnc(records):
+    out = []
+    for r in (records or []):
+        out.append({
+            "date":    r.get("Date", ""),
+            "branch":  r.get("Branch", ""),
+            "ref":     r.get("Bill No", ""),
+            "party":   r.get("Book Report") or r.get("Party", ""),
+            "amount":  r.get("Book Amt (Rs)", 0) or 0,
+            "note":    "",
+            "remark":  r.get("Narration", ""),
+            "cf":      bool(r.get("Is CF", False)),
+        })
+    return out
+
+
+def _qr_records_to_cnb(records):
+    out = []
+    for r in (records or []):
+        out.append({
+            "date":    r.get("Date", ""),
+            "branch":  r.get("Branch", ""),
+            "rrn":     r.get("RRN", ""),
+            "party":   r.get("Bank Statement") or r.get("Party", ""),
+            "amount":  r.get("Bank Amt (Rs)", 0) or 0,
+            "diff":    0,
+            "remark":  r.get("Narration", ""),
+            "cf":      bool(r.get("Is CF", False)),
+        })
+    return out
+
+
+def _qr_records_to_matched_rows(records):
+    out = []
+    for r in (records or []):
+        out.append({
+            "Method":       r.get("Match Method", ""),
+            "Name Match":   r.get("Name Match", ""),
+            "Amount Match": r.get("Amount Match", ""),
+            "Score%":       r.get("Fuzzy Score %", 0) or 0,
+            "Book Date":    r.get("Book Date", ""),
+            "Book Branch":  "",
+            "Book Bank":    "QRYESBANK",
+            "Book Bill No": r.get("Book Bill No", ""),
+            "Book Chq No":  r.get("Book Chq", 511) or 511,
+            "Book Party":   r.get("Book Party", ""),
+            "Book Amt":     r.get("Book Amt (Rs)", 0) or 0,
+            "Bank Date":    r.get("Bank Date", ""),
+            "Bank Time":    "",
+            "Bank Branch":  "",
+            "Bank Payer":   r.get("Bank Payer") or r.get("Bank Party", ""),
+            "Bank Amt":     r.get("Bank Amt (Rs)", 0) or 0,
+            "Bank RRN":     r.get("Bank RRN") or r.get("Bank Chq", ""),
+            "Pay Type":     "",
+            "Diff":         r.get("Difference (Rs)", 0) or 0,
+            "Flags":        r.get("Flags", ""),
+        })
+    return out
+
+
+class RegenerateQrRequest(BaseModel):
+    transaction_ref: str
+    matched:   List[Dict[str, Any]]
+    book_only: List[Dict[str, Any]]
+    bank_only: List[Dict[str, Any]]
+
+
+@app.post(
+    "/reconcile/regenerate-qr",
+    summary="Rebuild a QR reconciliation workbook from in-app edits (un-match / manual match).",
+)
+async def regenerate_qr_endpoint(payload: RegenerateQrRequest):
+    ref = (payload.transaction_ref or "").strip("/")
+    parts = ref.split("/")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail=f"Malformed transaction_ref: '{payload.transaction_ref}'")
+    date_folder, recon_type, txn_name = parts
+    if recon_type != "qr":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This endpoint only regenerates 'qr' reconciliations (got '{recon_type}').",
+        )
+
+    txn_dir = os.path.join(TRANSACTIONS_DIR, date_folder, recon_type, txn_name)
+    if not os.path.isdir(txn_dir):
+        raise HTTPException(status_code=404, detail=f"Transaction not found: '{ref}'")
+
+    def _find_archived(prefix):
+        for fname in sorted(os.listdir(txn_dir)):
+            if fname.startswith(prefix):
+                return os.path.join(txn_dir, fname)
+        return None
+
+    all_branches_path = _find_archived("all_branches")
+    hot_book_path      = _find_archived("hot_book")
+    stmt_path           = _find_archived("qr_statement")
+    prev_brs_path       = _find_archived("previous_brs")
+    if not all_branches_path or not hot_book_path or not stmt_path:
+        raise HTTPException(status_code=404, detail=f"Original input files missing for transaction '{ref}'.")
+    if prev_brs_path and os.path.getsize(prev_brs_path) == 0:
+        prev_brs_path = None
+
+    out_tmpdir = tempfile.mkdtemp()
+    try:
+        output_path = os.path.join(out_tmpdir, "QR_Reconciliation.xlsx")
+
+        override_dnc     = _qr_records_to_dnc(payload.book_only)
+        override_cnb     = _qr_records_to_cnb(payload.bank_only)
+        override_matched = _qr_records_to_matched_rows(payload.matched)
+
+        (matched_df, dnc_df, cnb_df,
+         closing_bal, bank_bal, reconciled,
+         brs_date, books_match, corr_amts) = process_qr_files(
+            all_branches_path = all_branches_path,
+            hot_book_path     = hot_book_path,
+            qr_stmt_path       = stmt_path,
+            output_path        = output_path,
+            prev_brs_path       = prev_brs_path,
+            override_dnc        = override_dnc,
+            override_cnb        = override_cnb,
+            override_matched    = override_matched,
+        )
+
+        with open(output_path, "rb") as f:
+            file_data = f.read()
+
+        # Per product decision: downloading after edits becomes the new
+        # permanent record for this transaction — overwrite the archive.
+        shutil.copy2(output_path, os.path.join(txn_dir, "QR_Reconciliation.xlsx"))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate QR workbook: {e}")
+    finally:
+        gc.collect()
+        shutil.rmtree(out_tmpdir, ignore_errors=True)
+
+    return JSONResponse(_sanitize({
+        "status":          "success",
+        "recon_type":      "qr",
+        "transaction_ref": ref,
+        "summary": {
+            "matched":    len(matched_df),
+            "book_only":  len(dnc_df),
+            "bank_only":  len(cnb_df),
+            "difference": round(bank_bal, 2) if not reconciled else 0.0,
+            "reconciled": reconciled,
+        },
+        "file_bytes": file_data.hex(),
+        "file_name":  "QR_Reconciliation.xlsx",
     }))
 
 
@@ -650,12 +1014,12 @@ async def reconcile_qr_endpoint(
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.post(
-    "/workflow/reconcile-gateway",
+    "/reconcile/reconcile-gateway",
     summary=(
         "Gateway YES Bank reconciliation — "
         "All-Branches book (.xls), HOT book (.xls), YES Bank PDF statement, "
         "PayU report (.xlsx) required; "
-        "PayU On-Demand, CashFree, EaseBuzz, Previous BRS optional."
+        "PayU On-Demand, CashFree, EaseBuzz, Smart Pay, Previous BRS optional."
     ),
 )
 async def reconcile_gateway_endpoint(
@@ -666,12 +1030,16 @@ async def reconcile_gateway_endpoint(
     payu_od_files:     list[UploadFile] = File(default=[], description="PayU On-Demand (.xlsx) — 0 to 4 files"),
     cashfree_files:    list[UploadFile] = File(default=[], description="CashFree (.xlsx) — 0 to 4 files"),
     easebuzz_files:    list[UploadFile] = File(default=[], description="EaseBuzz (.csv) — 0 to 4 files"),
+    smart_pay_files: list[UploadFile] = File(default=[],description="Smart Pay (.xlsx) — 0 to 4 files"),
     previous_brs_file: UploadFile = File(..., description="Previous day BRS workbook (.xlsx)"),
+    name_match_direct_file: UploadFile = File(..., description="Name Matching Report - Direct payment workbook (.xlsx)"),
+    name_match_file:        UploadFile = File(..., description="Name Matching Report workbook (.xlsx)"),
+    total_orders_file:      UploadFile = File(..., description="Total Orders List workbook (.xlsx)"),
 ):
     # Validate file extensions
     for f in [all_branches_file, hot_book_file]:
         _validate_filename(f.filename)
-    for f in payu_files + payu_od_files + cashfree_files:
+    for f in payu_files + payu_od_files + cashfree_files + smart_pay_files:
         _validate_filename(f.filename)
     for f in easebuzz_files:
         ext = os.path.splitext(f.filename)[1].lower()
@@ -679,6 +1047,9 @@ async def reconcile_gateway_endpoint(
             raise HTTPException(status_code=400,
                 detail=f"EaseBuzz file '{f.filename}' must be .csv or .xlsx")
     _validate_filename(previous_brs_file.filename)
+    _validate_filename(name_match_direct_file.filename)
+    _validate_filename(name_match_file.filename)
+    _validate_filename(total_orders_file.filename)
 
     tmpdir    = tempfile.mkdtemp()
     file_data = None
@@ -716,14 +1087,57 @@ async def reconcile_gateway_endpoint(
             with open(p, "wb") as f: f.write(await eb.read())
             easebuzz_paths.append(p)
 
+        smart_pay_paths = []
+        for sp in smart_pay_files:
+            p = os.path.join(tmpdir, sp.filename)
+            with open(p, "wb") as f:
+                f.write(await sp.read())
+            smart_pay_paths.append(p)
+
         prev_brs_path = os.path.join(tmpdir, previous_brs_file.filename)
         with open(prev_brs_path, "wb") as f: f.write(await previous_brs_file.read())
+
+        name_match_direct_path = os.path.join(tmpdir, name_match_direct_file.filename)
+        with open(name_match_direct_path, "wb") as f: f.write(await name_match_direct_file.read())
+
+        name_match_path = os.path.join(tmpdir, name_match_file.filename)
+        with open(name_match_path, "wb") as f: f.write(await name_match_file.read())
+
+        total_orders_path = os.path.join(tmpdir, total_orders_file.filename)
+        with open(total_orders_path, "wb") as f: f.write(await total_orders_file.read())
 
         # Sheet metadata (book files only — PDF has no sheets)
         all_branches_sheets = get_sheet_metadata(all_branches_path)
         hot_book_sheets     = get_sheet_metadata(hot_book_path)
 
-        output_path = os.path.join(tmpdir, "Gateway_Reconcilation.xlsx")
+        gateway_transaction_rows = count_gateway_transactions_by_bill_no_and_name(all_branches_path)
+        gateway_transactions = []
+        gateway_seen_transactions = {}
+        for row in gateway_transaction_rows.to_dict("records"):
+            key = (
+                str(row.get("party", "")).strip().upper(),
+                str(row.get("bill_no", "")).strip().upper(),
+            )
+            if key not in gateway_seen_transactions:
+                gateway_seen_transactions[key] = len(gateway_seen_transactions) + 1
+            gateway_transactions.append({
+                "Date": _format_transaction_date(row.get("date", "")),
+                "Bill No": row.get("bill_no", ""),
+                "Name": row.get("party", ""),
+                "TXN No": f"TXN-{gateway_seen_transactions[key]:02d}",
+            })
+
+        transaction_info = {
+            "file_name": all_branches_file.filename,
+            "row_count": len(gateway_transactions),
+            "transaction_count": len(gateway_seen_transactions),
+            "transaction_type": "gateway",
+            "transactions": _sanitize(gateway_transactions),
+        }
+
+        post_reconciliation(transaction_info)
+
+        output_path = os.path.join(tmpdir, "Gateway_BRS.xlsx")
         # Run full Gateway reconciliation
         (gateway_results,
          dnc_all,
@@ -764,7 +1178,11 @@ async def reconcile_gateway_endpoint(
             payu_od_paths     = payu_od_paths,
             cashfree_path     = cashfree_paths,
             easebuzz_paths    = easebuzz_paths,
+            smart_pay_paths=smart_pay_paths,
             prev_brs_path     = prev_brs_path,
+            name_match_direct_path = name_match_direct_path,
+            name_match_path        = name_match_path,
+            total_orders_path      = total_orders_path,
         )
 
         with open(output_path, "rb") as f:
@@ -779,9 +1197,13 @@ async def reconcile_gateway_endpoint(
         _gw_inputs += [(p, f"payu_od{i+1}{_ext(p)}")  for i, p in enumerate(payu_od_paths)]
         _gw_inputs += [(p, f"cashfree{i+1}{_ext(p)}") for i, p in enumerate(cashfree_paths)]
         _gw_inputs += [(p, f"easebuzz{i+1}{_ext(p)}") for i, p in enumerate(easebuzz_paths)]
+        _gw_inputs += [(p, f"smart_pay{i+1}{_ext(p)}") for i, p in enumerate(smart_pay_paths)]
         _gw_inputs.append((prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"))
+        _gw_inputs.append((name_match_direct_path, f"name_match_direct{_ext(name_match_direct_file.filename)}"))
+        _gw_inputs.append((name_match_path,        f"name_match{_ext(name_match_file.filename)}"))
+        _gw_inputs.append((total_orders_path,      f"total_orders{_ext(total_orders_file.filename)}"))
 
-        _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_Reconciliation.xlsx")
+        transaction_ref = _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
         
 
 
@@ -807,10 +1229,17 @@ async def reconcile_gateway_endpoint(
     }
 
     # ── Summary counts ────────────────────────────────────────────────────────
-    total_book_only = len(dnc_all)
-    total_bank_only = len(cnb_all)
+    total_book_only = len(dnc_all) + len(add1_all)
+    total_bank_only = len(cnb_all) + len(less2_all)
 
-    # ── Normalise book_only (DNC) for frontend ────────────────────────────────
+    # ── Normalise book_only (DNC = deposited-not-credited, INFLOW; plus
+    #    Add1 = issued-not-debited, OUTFLOW) for frontend ──────────────────────
+    # add1_all/less2_all were always computed for the BRS arithmetic
+    # (brs.add_issued / brs.less_debited_nb below) but never sent to the
+    # frontend at all — Book Only / Bank Only were silently missing two of
+    # the four outstanding-item buckets. Merging them in here, distinguished
+    # by Direction, matches exactly how bank/QR's book_only already
+    # conflates both directions into one array.
     book_only_records = []
     for item in dnc_all:
         raw_party   = str(item.get("party", ""))
@@ -836,8 +1265,33 @@ async def reconcile_gateway_endpoint(
             ),
             "Is CF": bool(item.get("cf", False)),
         })
+    for item in add1_all:
+        raw_party   = str(item.get("party", ""))
+        clean_party = raw_party.replace("INDIVI - ", "").strip()
+        book_only_records.append({
+            "Date":          item.get("date", ""),
+            "Txn Type":      "Gateway Settlement",
+            "Bill No":       item.get("utr", ""),
+            "Chq No":        "",
+            "Branch":        item.get("branch", ""),
+            "Book Report":   raw_party,
+            "Party":         clean_party,
+            "Direction":     "OUTFLOW",
+            "Sender":        raw_party,
+            "Recipient":     "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
+            "Book Amt (Rs)": item.get("amount", 0),
+            "Narration":     item.get("remark", ""),
+            "Gateway":       item.get("gateway", ""),
+            "Issue": (
+                "Carried Forward from Previous BRS"
+                if item.get("cf")
+                else item.get("remark") or "Issued NOT yet debited in Bank"
+            ),
+            "Is CF": bool(item.get("cf", False)),
+        })
 
-    # ── Normalise bank_only (CNB) for frontend ────────────────────────────────
+    # ── Normalise bank_only (CNB = credited-not-book, INFLOW; plus
+    #    Less2 = debited-not-book, OUTFLOW) for frontend ───────────────────────
     bank_only_records = []
     for item in cnb_all:
         raw_party = str(item.get("party", ""))
@@ -859,6 +1313,29 @@ async def reconcile_gateway_endpoint(
             "Issue": (
                 "Carried Forward from Previous BRS"
                 if item.get("cf") else "Bank credit — NOT yet in company book"
+            ),
+            "Is CF": bool(item.get("cf", False)),
+        })
+    for item in less2_all:
+        raw_party = str(item.get("party", ""))
+        gw_tag    = "[CF]" if item.get("cf") else f"[{item.get('gateway', '')}]"
+        bank_only_records.append({
+            "Date":           item.get("date", ""),
+            "Txn Type":       gw_tag,
+            "Bill No":        str(item.get("utr", "")),
+            "Chq No":         str(item.get("chq_no", "")),
+            "Book Report":    "",
+            "Bank Statement": raw_party,
+            "Party":          raw_party,
+            "Narration":      item.get("remark", ""),
+            "Direction":      "OUTFLOW",
+            "Sender":         raw_party,
+            "Recipient":      "ORIENT EXCHANGE AND FINANCIAL SERVICES PVT LTD",
+            "Bank Amt (Rs)":  item.get("amount", 0),
+            "Gateway":        item.get("gateway", ""),
+            "Issue": (
+                "Carried Forward from Previous BRS"
+                if item.get("cf") else "Debited in Bank — NOT yet in company book"
             ),
             "Is CF": bool(item.get("cf", False)),
         })
@@ -955,6 +1432,9 @@ async def reconcile_gateway_endpoint(
         "statement_file_name": statement_file.filename,
         "payu_files": [f.filename for f in payu_files],
         "previous_brs_file":   previous_brs_file.filename,
+        "name_match_direct_file": name_match_direct_file.filename,
+        "name_match_file":        name_match_file.filename,
+        "total_orders_file":      total_orders_file.filename,
 
         "all_branches_sheets": all_branches_sheets,
         "hot_book_sheets":     hot_book_sheets,
@@ -984,7 +1464,205 @@ async def reconcile_gateway_endpoint(
         },
 
         "file_bytes": file_data.hex(),
-        "file_name":  "Gateway_Reconcilation.xlsx",
+        "file_name":  "Gateway_BRS.xlsx",
+        "transaction_ref": transaction_ref,
+    }))
+
+
+# ── Gateway field-translation helpers ────────────────────────────────────────
+# Same idea as the QR ones above: the frontend receives normalized field
+# names (built in the endpoint above), but gateway_reconcilation.py's own
+# internals — dnc_all / add1_all / cnb_all / less2_all / cheque_match_report
+# — use a different raw shape. gateway_reconcilation.py keeps the two BRS
+# directions as separate lists per side (dnc_all vs add1_all, cnb_all vs
+# less2_all) rather than one Direction-tagged list like bank/QR, so the
+# split-back-by-Direction here is what makes that work.
+
+def _gw_records_to_dnc_add1(records):
+    """Split edited book_only records back into dnc_all (INFLOW) and
+    add1_all (OUTFLOW)."""
+    dnc, add1 = [], []
+    for r in (records or []):
+        item = {
+            "date":    r.get("Date", ""),
+            "branch":  r.get("Branch", ""),
+            "utr":     r.get("Bill No", ""),
+            "party":   r.get("Book Report") or r.get("Party", ""),
+            "amount":  r.get("Book Amt (Rs)", 0) or 0,
+            "remark":  r.get("Narration", ""),
+            "gateway": r.get("Gateway", ""),
+            "cf":      bool(r.get("Is CF", False)),
+        }
+        (add1 if r.get("Direction") == "OUTFLOW" else dnc).append(item)
+    return dnc, add1
+
+
+def _gw_records_to_cnb_less2(records):
+    """Split edited bank_only records back into cnb_all (INFLOW) and
+    less2_all (OUTFLOW)."""
+    cnb, less2 = [], []
+    for r in (records or []):
+        item = {
+            "date":    r.get("Date", ""),
+            "branch":  "",
+            "utr":     r.get("Bill No", ""),
+            "chq_no":  r.get("Chq No", ""),
+            "party":   r.get("Bank Statement") or r.get("Party", ""),
+            "amount":  r.get("Bank Amt (Rs)", 0) or 0,
+            "remark":  r.get("Narration", ""),
+            "gateway": r.get("Gateway", ""),
+            "cf":      bool(r.get("Is CF", False)),
+        }
+        (less2 if r.get("Direction") == "OUTFLOW" else cnb).append(item)
+    return cnb, less2
+
+
+def _gw_records_to_matched(records):
+    out = []
+    for r in (records or []):
+        out.append({
+            "verdict":            r.get("Match Method", ""),
+            "verdict_reason":     r.get("Flags", ""),
+            "name_score":         r.get("Fuzzy Score %", 0) or 0,
+            "book_date":          r.get("Book Date", ""),
+            "book_bill":          r.get("Book Bill No", ""),
+            "book_party":         r.get("Book Party", ""),
+            "book_amount":        r.get("Book Amt (Rs)", 0) or 0,
+            "bank_date":          r.get("Bank Date", ""),
+            "bank_ref":           r.get("Bank Chq", ""),
+            "bank_party":         r.get("Bank Party", ""),
+            "bank_amount":        r.get("Bank Amt (Rs)", 0) or 0,
+            "gateway":            "",
+            "total_order_branch": "",
+            "name_label":         "",
+            "amount_diff":        abs(r.get("Difference (Rs)", 0) or 0),
+        })
+    return out
+
+
+class RegenerateGatewayRequest(BaseModel):
+    transaction_ref: str
+    matched:   List[Dict[str, Any]]
+    book_only: List[Dict[str, Any]]
+    bank_only: List[Dict[str, Any]]
+
+
+@app.post(
+    "/reconcile/regenerate-gateway",
+    summary="Rebuild a Gateway reconciliation workbook from in-app edits (un-match / manual match).",
+)
+async def regenerate_gateway_endpoint(payload: RegenerateGatewayRequest):
+    ref = (payload.transaction_ref or "").strip("/")
+    parts = ref.split("/")
+    if len(parts) != 3:
+        raise HTTPException(status_code=400, detail=f"Malformed transaction_ref: '{payload.transaction_ref}'")
+    date_folder, recon_type, txn_name = parts
+    if recon_type != "gateway":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This endpoint only regenerates 'gateway' reconciliations (got '{recon_type}').",
+        )
+
+    txn_dir = os.path.join(TRANSACTIONS_DIR, date_folder, recon_type, txn_name)
+    if not os.path.isdir(txn_dir):
+        raise HTTPException(status_code=404, detail=f"Transaction not found: '{ref}'")
+
+    def _find_one(prefix):
+        for fname in sorted(os.listdir(txn_dir)):
+            if fname.startswith(prefix) and not fname[len(prefix):len(prefix) + 1].isdigit():
+                return os.path.join(txn_dir, fname)
+        return None
+
+    def _find_many(prefix):
+        out = []
+        for fname in sorted(os.listdir(txn_dir)):
+            stem = os.path.splitext(fname)[0]
+            if stem.startswith(prefix) and stem[len(prefix):].isdigit():
+                out.append(os.path.join(txn_dir, fname))
+        return out
+
+    all_branches_path = _find_one("all_branches")
+    hot_book_path      = _find_one("hot_book")
+    stmt_path           = _find_one("yes_bank_statement")
+    prev_brs_path       = _find_one("previous_brs")
+    name_match_direct_path = _find_one("name_match_direct")
+    name_match_path         = _find_one("name_match")
+    total_orders_path       = _find_one("total_orders")
+    payu_paths     = _find_many("payu")
+    payu_od_paths  = _find_many("payu_od")
+    cashfree_paths = _find_many("cashfree")
+    easebuzz_paths = _find_many("easebuzz")
+    smart_pay_paths = _find_many("smart_pay")
+
+    if not all_branches_path or not hot_book_path or not stmt_path or not payu_paths:
+        raise HTTPException(status_code=404, detail=f"Original input files missing for transaction '{ref}'.")
+    if prev_brs_path and os.path.getsize(prev_brs_path) == 0:
+        prev_brs_path = None
+
+    out_tmpdir = tempfile.mkdtemp()
+    try:
+        output_path = os.path.join(out_tmpdir, "Gateway_BRS.xlsx")
+
+        override_dnc, override_add1   = _gw_records_to_dnc_add1(payload.book_only)
+        override_cnb, override_less2  = _gw_records_to_cnb_less2(payload.bank_only)
+        override_matched              = _gw_records_to_matched(payload.matched)
+
+        (gateway_results, dnc_all, cnb_all, add1_all, less2_all,
+         closing_bal, bank_bal, reconciled, brs_date, books_match,
+         cheque_match_report, *_rest) = process_gateway_files(
+            all_branches_path      = all_branches_path,
+            hot_book_path          = hot_book_path,
+            statement_path         = stmt_path,
+            payu_paths              = payu_paths,
+            output_path              = output_path,
+            payu_od_paths             = payu_od_paths,
+            cashfree_path              = cashfree_paths,
+            easebuzz_paths              = easebuzz_paths,
+            smart_pay_paths              = smart_pay_paths,
+            prev_brs_path                 = prev_brs_path,
+            name_match_direct_path         = name_match_direct_path,
+            name_match_path                 = name_match_path,
+            total_orders_path                = total_orders_path,
+            override_dnc                      = override_dnc,
+            override_add1                      = override_add1,
+            override_cnb                        = override_cnb,
+            override_less2                       = override_less2,
+            override_matched                      = override_matched,
+        )
+
+        with open(output_path, "rb") as f:
+            file_data = f.read()
+
+        # Per product decision: downloading after edits becomes the new
+        # permanent record for this transaction — overwrite the archive.
+        shutil.copy2(output_path, os.path.join(txn_dir, "Gateway_BRS.xlsx"))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to regenerate Gateway workbook: {e}")
+    finally:
+        gc.collect()
+        shutil.rmtree(out_tmpdir, ignore_errors=True)
+
+    total_add1  = sum(i["amount"] for i in add1_all)
+    total_dnc   = sum(i["amount"] for i in dnc_all)
+    total_less2 = sum(i["amount"] for i in less2_all)
+    total_cnb   = sum(i["amount"] for i in cnb_all)
+
+    return JSONResponse(_sanitize({
+        "status":          "success",
+        "recon_type":      "gateway",
+        "transaction_ref": ref,
+        "summary": {
+            "matched":    len(cheque_match_report),
+            "book_only":  len(dnc_all) + len(add1_all),
+            "bank_only":  len(cnb_all) + len(less2_all),
+            "difference": round(bank_bal - (closing_bal + total_add1 - total_dnc - total_less2 + total_cnb), 2),
+            "reconciled": reconciled,
+        },
+        "file_bytes": file_data.hex(),
+        "file_name":  "Gateway_BRS.xlsx",
     }))
 
 
@@ -992,11 +1670,11 @@ async def reconcile_gateway_endpoint(
 def root():
     return {
         "status":  "ok",
-        "message": "POST /reconcile (bank) | /reconcile-qr (QR) | /reconcile-gateway (Gateway YES Bank)",
+        "message": "POST /reconcile/reconcile-bank (bank) | /reconcile/reconcile-qr (QR) | /reconcile/reconcile-gateway (Gateway YES Bank)",
     }
 
 
-@app.get("/workflow/file-download", summary="Download all archived transactions as a zip.")
+@app.get("/reconcile/file-download", summary="Download all archived transactions as a zip.")
 def file_download(background_tasks: BackgroundTasks):
     if not os.path.isdir(TRANSACTIONS_DIR) or not os.listdir(TRANSACTIONS_DIR):
         raise HTTPException(status_code=404, detail="No transactions archived yet.")

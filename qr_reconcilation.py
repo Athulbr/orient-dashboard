@@ -1,4 +1,3 @@
-
 import re
 import sys
 from copy import copy
@@ -960,6 +959,49 @@ def _fmt_bank_credit_date(row):
 #
 
 
+def _compute_step4b_matched_rows(step4b_matched):
+    """Convert step4b_matched (carry-forward cross-clear pairs: a previous
+    period's outstanding DNC item cleared by a previous period's outstanding
+    CNB item — a genuine match, but one the current period's book/bank
+    matching passes never see) into flat rows matching matched_rows' own
+    shape. This has always been computed and rendered — in the "Matched"
+    sheet's own section and in Human Verification's Section B — but never
+    merged into matched_df, so the API response (and the web UI's Matched
+    tab) has always silently omitted every one of these matches. Used to
+    extend matched_df for the return value only; the Excel's own separate
+    rendering of step4b_matched is untouched.
+    """
+    rows = []
+    for pair in (step4b_matched or []):
+        dnc = pair.get("dnc", {}) or {}
+        cnb = pair.get("cnb", {}) or {}
+        score = pair.get("score", 0) or 0
+        amt_diff = pair.get("amt_diff", 0) or 0
+        rows.append({
+            "Method": "4B-CarryForwardCrossClear",
+            "Name Match": "Match" if score >= FUZZY_THRESH else "Partial",
+            "Amount Match": "Exact" if abs(amt_diff) < 0.01 else f"Diff {amt_diff:+.2f}",
+            "Score%": score,
+            "Book Date": dnc.get("date", ""),
+            "Book Branch": dnc.get("branch", ""),
+            "Book Bank": QR_ACCOUNT_CODE,
+            "Book Bill No": dnc.get("ref", ""),
+            "Book Chq No": 511,
+            "Book Party": dnc.get("party", ""),
+            "Book Amt": dnc.get("amount", 0),
+            "Bank Date": cnb.get("date", ""),
+            "Bank Time": "",
+            "Bank Branch": cnb.get("branch", ""),
+            "Bank Payer": cnb.get("party", ""),
+            "Bank Amt": cnb.get("amount", 0),
+            "Bank RRN": cnb.get("rrn", ""),
+            "Pay Type": "",
+            "Diff": amt_diff,
+            "Flags": f"Carry-forward cross-clear (previous BRS DNC vs CNB) | name match {score}%",
+        })
+    return rows
+
+
 def process_qr_files(
     all_branches_path,
     hot_book_path,
@@ -967,6 +1009,9 @@ def process_qr_files(
     output_path,
     prev_brs_path,
     brs_date_override=None,
+    override_dnc=None,
+    override_cnb=None,
+    override_matched=None,
 ):
     """
     Run full QR reconciliation and write the output workbook.
@@ -1970,6 +2015,11 @@ def process_qr_files(
         branch_matches = bank_br == b_br
         is_branch_locked = method in ("1-Amt+Branch+Date", "1B-Amt+Branch+/-1day")
 
+        # Branch/date/amount equality alone is not enough to knock off a QR
+        # receipt. Very weak names must stay open for review instead of being
+        # displayed as matched and mirrored into Cheque Deposit.
+        if sc < FUZZY_ACCEPT:
+            continue
         if not is_branch_locked and sc < FUZZY_ACCEPT and not branch_matches:
             continue
         if sc < FUZZY_ACCEPT and _has_prev_cnb_exact_for_book(bk):
@@ -3249,7 +3299,7 @@ def process_qr_files(
                 min_pair_score = (
                     _prev_dnc_cnb_pair_name_threshold(dnc_item["amount"])
                     if abs_pair_diff <= 0.005
-                    else FUZZY_ACCEPT
+                    else FUZZY_THRESH
                 )
                 if sc < min_pair_score:
                     continue
@@ -3288,6 +3338,9 @@ def process_qr_files(
     # Clear previous DNC carry-forwards against current bank-only credits.
     # Handles both one current bank credit and split current bank credits.
     cnb_new_cleared_by_prev_dnc = set()
+    cnb_new_review_suggested = set()
+    prev_dnc_current_cnb_review_keys = set()
+    prev_dnc_current_reviewed_dnc_keys = set()
     prev_dnc_current_cnb_cleared = set()
     prev_dnc_current_cnb_matches = []
     prev_dnc_current_cnb_review_matches = []
@@ -3356,34 +3409,52 @@ def process_qr_files(
             continue
 
         # Review-only: same branch and exact amount, but name is too weak to
-        # auto-clear. Keep both BRS open items, but surface the possible pair
-        # in Matched and Human Verification for manual confirmation.
+        # auto-clear. Keep both BRS open items, but surface one possible pair
+        # in Human Verification for manual confirmation. Do not print these as
+        # matched/cheque-deposit rows; that makes a non-cleared item look knocked
+        # off and can repeat the same RRN across review displays.
         exact_review_candidates = [
             ci
             for ci in candidates
             if ci not in cnb_new_cleared_by_prev_dnc
+            and ci not in cnb_new_review_suggested
             and abs(cnb_new[ci]["amount"] - d_amt) <= 0.005
         ]
-        if exact_review_candidates:
+        dnc_review_key = (
+            str(dnc_item.get("branch", "")).strip(),
+            str(dnc_item.get("ref", "")).strip(),
+            round(float(d_amt), 2),
+        )
+        if exact_review_candidates and dnc_review_key not in prev_dnc_current_reviewed_dnc_keys:
             review_ci = max(
                 exact_review_candidates,
                 key=lambda ci: cf_name_sim(dnc_item["party"], cnb_new[ci]["party"]),
             )
             review_score = cf_name_sim(dnc_item["party"], cnb_new[review_ci]["party"])
-            prev_dnc_current_cnb_review_matches.append(
-                {
-                    "dnc": dnc_item,
-                    "cnb": cnb_new[review_ci],
-                    "score": review_score,
-                    "amt_diff": d_amt - cnb_new[review_ci]["amount"],
-                    "review_only": True,
-                }
+            review_key = (
+                str(dnc_item.get("branch", "")).strip(),
+                str(dnc_item.get("ref", "")).strip(),
+                round(float(d_amt), 2),
+                str(cnb_new[review_ci].get("rrn", "")).strip(),
             )
-            print(
-                f"  [CF-REVIEW] Previous DNC has same branch/amount current bank credit: "
-                f"{br}/{dnc_item['ref']}/{d_amt:,.0f} "
-                f"<-> {cnb_new[review_ci].get('rrn', '')} (name {review_score}%)"
-            )
+            if review_key not in prev_dnc_current_cnb_review_keys:
+                prev_dnc_current_cnb_review_keys.add(review_key)
+                prev_dnc_current_reviewed_dnc_keys.add(dnc_review_key)
+                cnb_new_review_suggested.add(review_ci)
+                prev_dnc_current_cnb_review_matches.append(
+                    {
+                        "dnc": dnc_item,
+                        "cnb": cnb_new[review_ci],
+                        "score": review_score,
+                        "amt_diff": d_amt - cnb_new[review_ci]["amount"],
+                        "review_only": True,
+                    }
+                )
+                print(
+                    f"  [CF-REVIEW] Previous DNC has same branch/amount current bank credit: "
+                    f"{br}/{dnc_item['ref']}/{d_amt:,.0f} "
+                    f"<-> {cnb_new[review_ci].get('rrn', '')} (name {review_score}%)"
+                )
 
         if len(candidates) < 2:
             continue
@@ -3532,6 +3603,31 @@ def process_qr_files(
             cnb_all_for_sheet.append(item)
 
     cnb_all = cnb_all_for_brs
+
+    # ── Regenerate-from-edits override point ────────────────────────────────
+    # Everything above this line — matching, carry-forward, settlement
+    # tracking, closing balances — has already run to completion and is
+    # completely unaffected by the parameters below. This is the one place
+    # where a /workflow/regenerate-qr call can substitute the frontend's
+    # edited tables in place of what the engine itself matched, so every
+    # sheet below (which all read dnc_all/cnb_all/matched_rows, directly or
+    # via dnc_all_for_sheet/cnb_all_for_sheet) reflects the edits without any
+    # of the ~2500 lines of workbook-writing code changing at all.
+    if override_dnc is not None:
+        dnc_all = list(override_dnc)
+        dnc_all_for_sheet = list(override_dnc)
+    if override_cnb is not None:
+        cnb_all = list(override_cnb)
+        cnb_all_for_sheet = list(override_cnb)
+    if override_matched is not None:
+        matched_rows = list(override_matched)
+        # step4b_matched (carry-forward cross-clear pairs) renders as its own
+        # separate section in both the Matched sheet and Human Verification.
+        # The edited matched_rows above already includes whatever step4b
+        # pairs survived the user's edits (app.py merges them in for the API
+        # the same way), so clear this out here to avoid double-rendering
+        # the same matches in two places.
+        step4b_matched = []
 
     review_dnc = [i for i in dnc_all if i.get("review_pair")]
     review_cnb = [i for i in cnb_all if i.get("review_pair")]
@@ -4551,6 +4647,9 @@ def process_qr_files(
     prev_dnc_current_cnb_display_matches = (
         prev_dnc_cnb_pair_matches
         + prev_dnc_current_cnb_matches
+    )
+    prev_dnc_current_cnb_hv_matches = (
+        prev_dnc_current_cnb_display_matches
         + prev_dnc_current_cnb_review_matches
     )
     if prev_dnc_current_cnb_display_matches:
@@ -5689,7 +5788,7 @@ def process_qr_files(
         )
         _sec_a_rows.append((m, issue_type, issue_desc))
 
-    for pair in prev_dnc_current_cnb_display_matches:
+    for pair in prev_dnc_current_cnb_hv_matches:
         dnc_p = pair["dnc"]
         cnb_p = pair["cnb"]
         sc = pair.get("score", 0) or 0
@@ -6366,9 +6465,10 @@ def process_qr_files(
     #
     #  BUILD RETURN DataFrames
     #
+    _step4b_rows_for_api = _compute_step4b_matched_rows(step4b_matched)
     matched_df = (
-        pd.DataFrame(matched_rows)
-        if matched_rows
+        pd.DataFrame(matched_rows + _step4b_rows_for_api)
+        if (matched_rows or _step4b_rows_for_api)
         else pd.DataFrame(
             columns=[
                 "Method",
@@ -6450,7 +6550,3 @@ if __name__ == "__main__":
         prev_brs_path=args.prev_brs,
         brs_date_override=args.date,
     )
-
-
-
-
