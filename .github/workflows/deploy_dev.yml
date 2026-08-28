@@ -9,7 +9,7 @@ on:
 
 jobs:
   deploy:
-    uses: rehab-mart/cicd-actions/.github/workflows/reusable-onprem-deploy.yml@main
+    uses: rehab-mart/cicd-actions/.github/workflows/reusable-onprem for bank-reconciliation_deploy.yml@main
 
     with:
       app_name: "bank_reconciliation"
