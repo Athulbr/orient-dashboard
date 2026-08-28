@@ -1110,7 +1110,6 @@ async def reconcile_gateway_endpoint(
         all_branches_sheets = get_sheet_metadata(all_branches_path)
         hot_book_sheets     = get_sheet_metadata(hot_book_path)
 
-<<<<<<< HEAD
         gateway_transaction_rows = count_gateway_transactions_by_bill_no_and_name(all_branches_path)
         gateway_transactions = []
         gateway_seen_transactions = {}
@@ -1138,8 +1137,6 @@ async def reconcile_gateway_endpoint(
 
         post_reconciliation(transaction_info)
 
-=======
->>>>>>> 89540cc6622848db88645975db4d2eb7ff4d6852
         output_path = os.path.join(tmpdir, "Gateway_BRS.xlsx")
         # Run full Gateway reconciliation
         (gateway_results,
@@ -1206,11 +1203,7 @@ async def reconcile_gateway_endpoint(
         _gw_inputs.append((name_match_path,        f"name_match{_ext(name_match_file.filename)}"))
         _gw_inputs.append((total_orders_path,      f"total_orders{_ext(total_orders_file.filename)}"))
 
-<<<<<<< HEAD
         transaction_ref = _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
-=======
-        _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
->>>>>>> 89540cc6622848db88645975db4d2eb7ff4d6852
         
 
 
@@ -1472,7 +1465,6 @@ async def reconcile_gateway_endpoint(
 
         "file_bytes": file_data.hex(),
         "file_name":  "Gateway_BRS.xlsx",
-<<<<<<< HEAD
         "transaction_ref": transaction_ref,
     }))
 
@@ -1671,8 +1663,6 @@ async def regenerate_gateway_endpoint(payload: RegenerateGatewayRequest):
         },
         "file_bytes": file_data.hex(),
         "file_name":  "Gateway_BRS.xlsx",
-=======
->>>>>>> 89540cc6622848db88645975db4d2eb7ff4d6852
     }))
 
 
