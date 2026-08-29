@@ -21,6 +21,7 @@ from qr_reconcilation import process_qr_files, count_transactions_by_bill_no_and
 from gateway_reconcilation import process_gateway_files, count_transactions_by_bill_no_and_name as count_gateway_transactions_by_bill_no_and_name
 import requests
 from config import RECONCILIATION_API, TRANSACTIONS_DIR
+import pipeline
 
 app = FastAPI(title="Bank Reconciliation API")
 
@@ -69,6 +70,7 @@ def _archive_transaction(recon_type, input_files, output_path, output_name):
                 shutil.copy2(src_path, os.path.join(txn_dir, save_name))
         if output_path and os.path.exists(output_path):
             shutil.copy2(output_path, os.path.join(txn_dir, output_name))
+        _invalidate_dashboard_cache_async()
         return os.path.relpath(txn_dir, TRANSACTIONS_DIR).replace(os.sep, "/")
     except Exception as e:
         print(f"[archive] Failed to archive {recon_type} transaction: {e}")
@@ -540,6 +542,7 @@ async def regenerate_endpoint(payload: RegenerateBankRequest):
         # Per product decision: downloading after edits becomes the new
         # permanent record for this transaction — overwrite the archive.
         shutil.copy2(output_path, os.path.join(txn_dir, "Reconciliation.xlsx"))
+        _invalidate_dashboard_cache_async()
 
     except HTTPException:
         raise
@@ -984,6 +987,7 @@ async def regenerate_qr_endpoint(payload: RegenerateQrRequest):
         # Per product decision: downloading after edits becomes the new
         # permanent record for this transaction — overwrite the archive.
         shutil.copy2(output_path, os.path.join(txn_dir, "QR_Reconciliation.xlsx"))
+        _invalidate_dashboard_cache_async()
 
     except HTTPException:
         raise
@@ -1636,6 +1640,7 @@ async def regenerate_gateway_endpoint(payload: RegenerateGatewayRequest):
         # Per product decision: downloading after edits becomes the new
         # permanent record for this transaction — overwrite the archive.
         shutil.copy2(output_path, os.path.join(txn_dir, "Gateway_BRS.xlsx"))
+        _invalidate_dashboard_cache_async()
 
     except HTTPException:
         raise
@@ -1666,11 +1671,85 @@ async def regenerate_gateway_endpoint(payload: RegenerateGatewayRequest):
     }))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DASHBOARD — aggregated view over the transactions archive, coupled into
+# this same app (not a separate service): it reads TRANSACTIONS_DIR straight
+# off disk via pipeline.py, no zip/export/HTTP round-trip needed. The cache
+# is rebuilt in the background whenever data actually changes — right after
+# _archive_transaction() (covers reconcile-bank/qr/gateway) and after every
+# regenerate-* call (which overwrites the archived output workbook the HV
+# section counts are read from) — never on a blind timer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_dashboard_lock = threading.Lock()
+_dashboard_cache = {"data": None, "building": False, "error": None, "built_at": None}
+
+
+def _rebuild_dashboard_cache():
+    try:
+        # A fresh deployment won't have TRANSACTIONS_DIR yet - the first
+        # reconcile-*/regenerate-* call creates it lazily (_next_transaction_dir),
+        # same as the rest of this app. Treat "doesn't exist" as "no data yet",
+        # not an error.
+        os.makedirs(TRANSACTIONS_DIR, exist_ok=True)
+        data = pipeline.build_dashboard_data(TRANSACTIONS_DIR, "live")
+        with _dashboard_lock:
+            _dashboard_cache["data"] = data
+            _dashboard_cache["error"] = None
+            _dashboard_cache["built_at"] = datetime.now().isoformat()
+    except Exception as e:
+        with _dashboard_lock:
+            _dashboard_cache["error"] = str(e)
+    finally:
+        with _dashboard_lock:
+            _dashboard_cache["building"] = False
+
+
+def _invalidate_dashboard_cache_async():
+    """Kick off a background rebuild — never blocks the caller (a
+    reconcile-*/regenerate-* request that just finished writing to the
+    archive), and coalesces with any rebuild already in flight."""
+    with _dashboard_lock:
+        if _dashboard_cache["building"]:
+            return
+        _dashboard_cache["building"] = True
+    threading.Thread(target=_rebuild_dashboard_cache, daemon=True).start()
+
+
+@app.on_event("startup")
+def _warm_dashboard_cache():
+    _invalidate_dashboard_cache_async()
+
+
+@app.get(
+    "/reconcile/dashboard-data",
+    summary="Aggregated day/channel dashboard stats, read live off the transactions archive.",
+)
+def dashboard_data():
+    with _dashboard_lock:
+        if _dashboard_cache["data"] is not None:
+            return JSONResponse(_sanitize(_dashboard_cache["data"]))
+        building = _dashboard_cache["building"]
+        error = _dashboard_cache["error"]
+    if error and not building:
+        raise HTTPException(status_code=500, detail=f"Last dashboard build failed: {error}")
+    raise HTTPException(status_code=202, detail="Dashboard cache is still building, try again in a moment.")
+
+
+@app.post("/reconcile/dashboard-refresh", summary="Force an immediate dashboard cache rebuild.")
+def dashboard_refresh():
+    _invalidate_dashboard_cache_async()
+    return {"status": "refresh started"}
+
+
 @app.get("/", summary="API status")
 def root():
     return {
         "status":  "ok",
-        "message": "POST /reconcile/reconcile-bank (bank) | /reconcile/reconcile-qr (QR) | /reconcile/reconcile-gateway (Gateway YES Bank)",
+        "message": (
+            "POST /reconcile/reconcile-bank (bank) | /reconcile/reconcile-qr (QR) | "
+            "/reconcile/reconcile-gateway (Gateway YES Bank) | GET /reconcile/dashboard-data"
+        ),
     }
 
 
