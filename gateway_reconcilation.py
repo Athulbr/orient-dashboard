@@ -194,6 +194,82 @@ def _normalise_bill_no(value):
         return "PS" + s
     return ""
 
+
+def count_transactions_by_bill_no_and_name(all_branches_path):
+    """Return sequential transaction numbers from the All-Branches report.
+
+    A normalized party retains the same transaction number for repeated rows
+    with the same bill number.  A different bill number for that party starts
+    the next number.  This mirrors the transaction-count helper used by the
+    QR Yes Bank/HDFC reconciliation, while retaining Gateway's ``PS-`` bill
+    number convention.
+
+    The helper is intentionally read-only: the generated workbook and its
+    reconciliation/matching logic are not changed merely by making this
+    count available.
+    """
+    source = Path(all_branches_path)
+    try:
+        df_all = _safe_read_excel(source, header=None)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to read All-Branches Book Report\n"
+            f"  File: {source}\n"
+            f"  Error: {exc}"
+        ) from exc
+
+    required_cols = {0, 2, 3, 6}
+    missing_cols = sorted(required_cols.difference(df_all.columns))
+    if missing_cols:
+        raise ValueError(
+            "All-Branches Book Report is missing required column(s): "
+            + ", ".join(str(col) for col in missing_cols)
+        )
+
+    skip = {
+        "Transaction", "GATEWAY", "Public Sale", "Receipts", "Payments",
+        "Summary Of GATEWAY", "Opening Balance", "nan", "",
+    }
+    current_branch = None
+    branches = []
+    for _, row in df_all.iterrows():
+        value = str(row[0]).strip() if pd.notna(row[0]) else ""
+        if value not in skip and not value.startswith("Summary"):
+            current_branch = value
+        branches.append(current_branch)
+    df_all = df_all.copy()
+    df_all["_transaction_branch"] = branches
+
+    rows = df_all[df_all[0].astype(str).str.strip().eq("Public Sale")].copy()
+    result_columns = ["date", "branch", "bill_no", "party", "transaction_no"]
+    if rows.empty:
+        return pd.DataFrame(columns=result_columns)
+
+    rows["date"] = pd.to_datetime(rows[2], errors="coerce")
+    rows["branch"] = rows["_transaction_branch"].fillna("").astype(str).str.split(" - ").str[0]
+    raw_bill = rows[3].apply(lambda value: str(value).strip().removesuffix(".0"))
+    rows["bill_no"] = "PS-" + raw_bill
+    rows["party"] = rows[6].astype(str).str.replace("INDIVI - ", "", regex=False).str.strip()
+    rows = rows[
+        rows["bill_no"].ne("PS-")
+        & rows["bill_no"].str.lower().ne("ps-nan")
+        & rows["party"].ne("")
+        & rows["party"].str.lower().ne("nan")
+    ].copy()
+
+    party_bills = {}
+    transaction_numbers = []
+    for _, row in rows.iterrows():
+        party_key = _normalise_name(row["party"])
+        bill_key = _normalise_bill_no(row["bill_no"])
+        bills_for_party = party_bills.setdefault(party_key, {})
+        if bill_key not in bills_for_party:
+            bills_for_party[bill_key] = len(bills_for_party) + 1
+        transaction_numbers.append(bills_for_party[bill_key])
+
+    rows["transaction_no"] = transaction_numbers
+    return rows[result_columns].reset_index(drop=True)
+
 def _same_amount(a, b, tol=1.0):
     return abs(float(a or 0.0) - float(b or 0.0)) < tol
 
