@@ -1409,16 +1409,58 @@ def process_gateway_files(
                 utr    = str(row[2]).strip() if len(row) > 2 and row[2] is not None else ""
                 party  = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
                 remark = str(row[7]).strip() if len(row) > 7 and row[7] is not None else ""
+                chq_no = ""
+                pg_party = ""
                 gw = "PAYU"
+
+                # Legacy manually-maintained Gateway BRS files use two
+                # different row shapes.  In Add1/DNC the columns are
+                # Date, Branch, Gateway, *Bill*, Cheque No., *Party*, Amount,
+                # ..., Remark.  In Less2/CNB they are Date, Branch, *UTR*,
+                # *Customer/PG name*, Gateway, *Bank name*, Amount, ... .
+                #
+                # The former generic reader treated both as the latter shape,
+                # so a DNC row such as ``GATEWAY | PS-6202389 | 511 | ASHISH``
+                # was carried forward as UTR=GATEWAY and Party=511. Amounts
+                # remained correct (hence the BRS balanced), but a later bank
+                # credit could not be recognised as clearing that cheque and
+                # therefore never reached Cheque Deposits or Matched.
+                legacy_gateway_row = (
+                    key in ("add1", "dnc")
+                    and str(row[2] if len(row) > 2 else "").strip().upper() == "GATEWAY"
+                )
+                legacy_gateway_credit_row = (
+                    key in ("less2", "cnb")
+                    and str(row[4] if len(row) > 4 else "").strip().upper()
+                    in ("PAYU", "CASHFREE", "EASEBUZZ", "SMARTPAY", "SMART PAY")
+                )
+                if legacy_gateway_row:
+                    utr = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+                    chq_no = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
+                    party = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
+                    remark = str(row[8]).strip() if len(row) > 8 and row[8] is not None else remark
+                    gw = "GATEWAY"
+                elif legacy_gateway_credit_row:
+                    party = str(row[3]).strip() if len(row) > 3 and row[3] is not None else ""
+                    pg_party = str(row[5]).strip() if len(row) > 5 and row[5] is not None else ""
+                    gw = str(row[4]).strip()
+                    remark = (
+                        str(row[8]).strip() if len(row) > 8 and row[8] is not None else remark
+                    )
                 utr_up = utr.upper()
                 if "CASHFREE" in branch.upper() or "AXISCN" in utr_up:
                     gw = "CASHFREE"
                 elif "EASEBUZZ" in branch.upper() or utr_up.startswith("YESF"):
                     gw = "EASEBUZZ"
-                items.append(dict(
+                item = dict(
                     date=dt, branch=branch, utr=utr, party=party,
                     amount=float(amt), remark=remark, gateway=gw, cf=cf_flag,
-                ))
+                )
+                if chq_no:
+                    item["chq_no"] = chq_no
+                if pg_party:
+                    item["pg_party"] = pg_party
+                items.append(item)
             return items
     
         result["add1"]  = _extract_section("add1",  cf_flag=True)
