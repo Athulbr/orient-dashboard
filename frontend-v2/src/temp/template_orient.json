@@ -1,0 +1,384 @@
+{
+  "name": "Orient Combined New (Vinayak 3)",
+  "fields": [
+  {
+    "name": "Passport",
+    "dataType": "dict",
+    "jsonKey": "passport",
+    "instruction": "Extract passport details",
+    "subFields": [
+      {
+        "name": "Passenger Name",
+        "dataType": "str",
+        "jsonKey": "paxname",
+        "instruction": "Extract name as printed on passport. Example: USHA M.",
+        "required": true
+      },
+      {
+        "name": "Passport Number",
+        "dataType": "str",
+        "jsonKey": "passportno",
+        "instruction": "Extract passport number from MRZ line 1 — mandatory for SALE. Example: P1234567",
+        "required": true
+      },
+      {
+        "name": "Passport Issue From",
+        "dataType": "str",
+        "jsonKey": "passport_issuefrom",
+        "instruction": "Extract place of issue — mandatory if PASSPORTNO present. Example: MUM",
+        "required": true
+      },
+      {
+        "name": "Passport Issue Date",
+        "dataType": "str",
+        "jsonKey": "passport_issuedate",
+        "instruction": "Extract passport issue date — mandatory if PASSPORTNO present; must be past or current date. Example: 01-APR-2020",
+        "required": true
+      },
+      {
+        "name": "Passport Expiry Date",
+        "dataType": "str",
+        "jsonKey": "passport_expirydate",
+        "instruction": "Extract passport expiry date — mandatory if PASSPORTNO present; must be future date, flag if expired. Example: 31-MAR-2030",
+        "required": true
+      },
+      {
+        "name": "Date of Birth",
+        "dataType": "str",
+        "jsonKey": "dob",
+        "instruction": "Extract date of birth — must be past date, validate before submission. Example: 22-FEB-1972",
+        "required": true
+      },
+      {
+        "name": "Gender",
+        "dataType": "str",
+        "jsonKey": "gender",
+        "instruction": "Extract gender — passport shows M/F, map to Male/Female/Other. Example: FEMALE",
+        "required": true
+      },
+      {
+        "name": "Nationality",
+        "dataType": "str",
+        "jsonKey": "nationality",
+        "instruction": "Extract nationality — must match Maraekat enum, use reference data API. Example: INDIAN",
+        "required": true
+      },
+      {
+        "name": "First Name",
+        "dataType": "str",
+        "jsonKey": "firstname",
+        "instruction": "Extract first name split from PAXNAME — either PAXNAME or FIRSTNAME must be present.",
+        "required": false
+      },
+      {
+        "name": "Last Name",
+        "dataType": "str",
+        "jsonKey": "lastname",
+        "instruction": "Extract last name split from PAXNAME — parse last word.",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "PAN Card",
+    "dataType": "dict",
+    "jsonKey": "pan_card",
+    "instruction": "Extract PAN card details",
+    "subFields": [
+      {
+        "name": "PAN Number",
+        "dataType": "str",
+        "jsonKey": "panno",
+        "instruction": "Extract PAN number — 10-char pattern: 5 alpha + 4 numeric + 1 alpha, validate regex; mandatory for SALE. Example: AUZPM2687E",
+        "required": true
+      },
+      {
+        "name": "PAN Card Holder Name",
+        "dataType": "str",
+        "jsonKey": "pancardholdername",
+        "instruction": "Extract full name on PAN — often differs from PAXNAME, extract separately; mandatory if PANNO present. Example: USHA SHAILESH MEISHERI",
+        "required": true
+      },
+      {
+        "name": "Father Name",
+        "dataType": "str",
+        "jsonKey": "fathername",
+        "instruction": "Extract father name if printed on PAN card — not always present.",
+        "required": false
+      },
+      {
+        "name": "First Name",
+        "dataType": "str",
+        "jsonKey": "firstname",
+        "instruction": "Extract first name split from PAXNAME — either PAXNAME or FIRSTNAME must be present.",
+        "required": false
+      },
+      {
+        "name": "Last Name",
+        "dataType": "str",
+        "jsonKey": "lastname",
+        "instruction": "Extract last name split from PAXNAME — parse last word.",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "Derived from PAN Number",
+    "dataType": "dict",
+    "jsonKey": "derived_from_panno",
+    "instruction": "Derive fields from PAN number — no OCR needed",
+    "subFields": [
+      {
+        "name": "Type of Person",
+        "dataType": "str",
+        "jsonKey": "typeofperson",
+        "instruction": "Derive from 4th character of PANNO — P = Person, C = Corporate. Example: P",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "Aadhaar Card",
+    "dataType": "dict",
+    "jsonKey": "aadhaar_card",
+    "instruction": "Extract Aadhaar card details",
+    "subFields": [
+      {
+        "name": "Aadhaar Card Number",
+        "dataType": "str",
+        "jsonKey": "adhaarcardno",
+        "instruction": "Extract Aadhaar card number — for PURCHASE, any one ID (Aadhaar / Voter / Driving Licence) is mandatory.",
+        "required": false
+      },
+      {
+        "name": "Passenger Address",
+        "dataType": "str",
+        "jsonKey": "paxaddress",
+        "instruction": "Extract passenger address — either PAXADDRESS or BuildingFlatNO must be present.",
+        "required": true
+      },
+      {
+        "name": "Building / Flat Number",
+        "dataType": "str",
+        "jsonKey": "buildingflatno",
+        "instruction": "Extract building or flat number — either BuildingFlatNO or PAXADDRESS must be present.",
+        "required": false
+      },
+      {
+        "name": "Street Name",
+        "dataType": "str",
+        "jsonKey": "streetname",
+        "instruction": "Extract street name — address line 2.",
+        "required": false
+      },
+      {
+        "name": "Location",
+        "dataType": "str",
+        "jsonKey": "location",
+        "instruction": "Extract location — either LOCATION or CITY must be present. Example: MUMBAI",
+        "required": false
+      },
+      {
+        "name": "City",
+        "dataType": "str",
+        "jsonKey": "city",
+        "instruction": "Extract city — either LOCATION or CITY must be present. Example: MUMBAI",
+        "required": false
+      },
+      {
+        "name": "Pin Code",
+        "dataType": "str",
+        "jsonKey": "pincode",
+        "instruction": "Extract pin code — numeric only, 6 digits, no spaces. Example: 400080",
+        "required": true
+      },
+      {
+        "name": "State Name",
+        "dataType": "str",
+        "jsonKey": "statename",
+        "instruction": "Extract state name — must match Maraekat enum, use reference data API. Example: MAHARASHTRA",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "Customer Declaration",
+    "dataType": "dict",
+    "jsonKey": "customer_declaration",
+    "instruction": "Extract customer declaration details",
+    "subFields": [
+      {
+        "name": "Passenger Address",
+        "dataType": "str",
+        "jsonKey": "paxaddress",
+        "instruction": "Extract passenger address — either PAXADDRESS or BuildingFlatNO must be present.",
+        "required": true
+      },
+      {
+        "name": "Parent Name",
+        "dataType": "str",
+        "jsonKey": "parentname",
+        "instruction": "Extract parent name — not on standard ID docs.",
+        "required": false
+      },
+      {
+        "name": "Building / Flat Number",
+        "dataType": "str",
+        "jsonKey": "buildingflatno",
+        "instruction": "Extract building or flat number — either BuildingFlatNO or PAXADDRESS must be present.",
+        "required": false
+      },
+      {
+        "name": "Street Name",
+        "dataType": "str",
+        "jsonKey": "streetname",
+        "instruction": "Extract street name — address line 2.",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "Voter ID Card",
+    "dataType": "dict",
+    "jsonKey": "voter_id_card",
+    "instruction": "Extract Voter ID card details",
+    "subFields": [
+      {
+        "name": "Voter Card Number",
+        "dataType": "str",
+        "jsonKey": "votercardno",
+        "instruction": "Extract voter card number — for PURCHASE, any one ID mandatory.",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "Driving Licence",
+    "dataType": "dict",
+    "jsonKey": "driving_licence",
+    "instruction": "Extract driving licence details",
+    "subFields": [
+      {
+        "name": "Driving Licence Number",
+        "dataType": "str",
+        "jsonKey": "drivinglicno",
+        "instruction": "Extract driving licence number — for PURCHASE, any one ID mandatory.",
+        "required": false
+      }
+    ]
+  },
+  {
+    "name": "Derived / Orient Portal",
+    "dataType": "dict",
+    "jsonKey": "derived_orient_portal",
+    "instruction": "Extract or derive country details",
+    "subFields": [
+      {
+        "name": "Country",
+        "dataType": "str",
+        "jsonKey": "country",
+        "instruction": "Extract country — must match Maraekat enum, use reference data API. Example: INDIA",
+        "required": true
+      }
+    ]
+  },
+  {
+    "name": "Travel Itinerary",
+    "dataType": "dict",
+    "jsonKey": "travel_itinerary",
+    "instruction": "Extract travel itinerary details",
+    "subFields": [
+      {
+        "name": "PNR Number",
+        "dataType": "str",
+        "jsonKey": "pnrno",
+        "instruction": "Extract PNR number — for SALE, either PNRNO or TICKETNO is mandatory. Example: PNR123",
+        "required": false
+      },
+      {
+        "name": "Ticket Number",
+        "dataType": "str",
+        "jsonKey": "ticketno",
+        "instruction": "Extract ticket number — for SALE, either PNRNO or TICKETNO is mandatory.",
+        "required": false
+      },
+      {
+        "name": "Airline Name",
+        "dataType": "str",
+        "jsonKey": "airlinename",
+        "instruction": "Extract airline name — for SALE mandatory; must match Maraekat enum, use reference data API. Example: AIR CANADA",
+        "required": false
+      },
+      {
+        "name": "Departure From",
+        "dataType": "str",
+        "jsonKey": "departurefrom",
+        "instruction": "Extract IATA airport code of departure — for SALE mandatory. Example: MUM",
+        "required": true
+      },
+      {
+        "name": "Departure Date",
+        "dataType": "str",
+        "jsonKey": "departuredate",
+        "instruction": "Extract departure date — for SALE mandatory; must be future or today, validate before submission. Example: 01-APR-2026",
+        "required": true
+      },
+      {
+        "name": "Traveling Country",
+        "dataType": "str",
+        "jsonKey": "travelingcountry",
+        "instruction": "Extract traveling country — for SALE mandatory; must match Maraekat enum, use reference data API. Example: UNITED KINGDOM",
+        "required": true
+      },
+      {
+        "name": "Arrival Date",
+        "dataType": "str",
+        "jsonKey": "arrivaldate",
+        "instruction": "Extract arrival date — for PURCHASE mandatory; must be past or current date.",
+        "required": true
+      },
+      {
+        "name": "Route",
+        "dataType": "str",
+        "jsonKey": "route",
+        "instruction": "Extract route — free field, optional. Example: MUM-LHR",
+        "required": false
+      }
+    ]
+  }
+]
+  ,
+  "settings": {
+    "primaryLLMProvider": "azure",
+    "primaryLLMModel": "gpt-4o-docsnap",
+    "secondaryLLMProvider": "azure_openai",
+    "secondaryLLMModel": "gpt-4o-docsnap",
+    "extractionEngine": "workflow",
+    "ocrEngine": "googleVisionApi",
+    "confidenceScore": "ocr",
+    "confidenceThresholdInPercentage": "20",
+    "documentNumberKey": "basic_details.po_number.value",
+    "documentDateKey": "",
+    "dynamicFileNameFirstKey": "basic_details.po_number.value",
+    "dynamicFileNameLastKey": "",
+    "prefixRecordName": "",
+    "automationId": "1",
+    "extractionLimit": 0,
+    "module": "docsnap",
+    "excludedPageNumbers": "",
+    "dynamicFileName": true,
+    "extractSingleDocument": true,
+    "includeImageForExtraction": true,
+    "enableInvoiceGenerator": false,
+    "enableChatWithDocument": true,
+    "enableOCR": true,
+    "requestNewField": true,
+    "reExtraction": true,
+    "alignmentCorrection": false,
+    "includeTextForExtraction": false,
+    "agenticExtraction": false,
+    "extractMultipleDocuments": false
+  },
+  "s3FileName": "University_offer_letter.pdf",
+  "active": true
+}

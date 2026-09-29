@@ -1,0 +1,144 @@
+.sheet-viewer {
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.sheet-empty {
+  padding: 32px;
+  text-align: center;
+  color: #9ca3af;
+  font-size: 14px;
+}
+
+.sheet-viewer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.sheet-file-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #111827;
+}
+
+.sheet-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: #6b7280;
+}
+
+.sheet-meta-sep {
+  color: #d1d5db;
+}
+
+.sheet-tabs {
+  display: flex;
+  gap: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0 12px;
+  background: #f9fafb;
+}
+
+
+.sheet-tab {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  font-family: inherit;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+
+.sheet-tab:hover {
+  background: #f3f4f6;
+  color: #111827;
+}
+
+.sheet-tab.active {
+  border-bottom-color: #2563eb;
+  background: #ffffff;
+}
+
+.sheet-tab-name {
+  font-size: 13px;
+  font-weight: 500;
+  color: #374151;
+  margin-bottom: 2px;
+}
+
+.sheet-tab.active .sheet-tab-name {
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.sheet-tab-count {
+  font-size: 11px;
+  color: #9ca3af;
+  font-variant-numeric: tabular-nums;
+}
+
+.sheet-columns {
+  padding: 18px;
+}
+
+.sheet-columns-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: #9ca3af;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 12px;
+}
+
+.sheet-columns-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 6px;
+}
+
+.sheet-column-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 5px;
+  font-size: 12.5px;
+}
+
+.sheet-column-index {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  background: #e5e7eb;
+  color: #6b7280;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.sheet-column-name {
+  color: #374151;
+  font-weight: 500;
+  word-break: break-word;
+  line-height: 1.3;
+}

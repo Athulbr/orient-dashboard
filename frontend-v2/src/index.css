@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&display=swap');
+
+@import 'tailwindcss';
+@import './global-utils/animation.css';
+@import './global-utils/color-palette.css';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+    --font-dmsans: 'DM Sans', sans-serif;
+    --font-vscode-mono: Consolas, Menlo, Monaco, 'Courier New', monospace;
+}
+
+/* For default border color (--color-gray-200) */
+@layer base {
+    *,
+    ::after,
+    ::before,
+    ::backdrop,
+    ::file-selector-button {
+        border-color: var(--color-gray-200, currentColor);
+        font-family: var(--font-dmsans);
+    }
+}
+html,
+body {
+    overscroll-behavior: none;
+    overflow-y: auto;
+}
+
+/* Scrollbar CSS */
+::-webkit-scrollbar {
+    width: 2px;
+    border: 1px solid #d5d5d5;
+    display: none;
+}
+
+::-webkit-scrollbar-track {
+    border-radius: 0;
+    background: #eeeeee;
+}
+
+::-webkit-scrollbar-thumb {
+    border-radius: 0;
+    background: rgb(137, 137, 137);
+}
+
+::-webkit-scrollbar:horizontal {
+    height: 2px;
+}
+
+* {
+    input:-webkit-autofill {
+        -webkit-box-shadow: 0 0 0 50px white inset; /* Change the color to your own background color */
+        -webkit-text-fill-color: #333;
+    }
+    input:-webkit-autofill:focus {
+        -webkit-box-shadow: 0 0 0 50px white inset; /*your box-shadow*/
+        -webkit-text-fill-color: #333;
+    }
+}

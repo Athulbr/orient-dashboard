@@ -1,0 +1,9 @@
+.container {
+  background-color: white;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  overflow-y: auto;
+  padding: 16px;
+}

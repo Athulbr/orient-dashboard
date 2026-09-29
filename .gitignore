@@ -9,3 +9,10 @@ QR RECO/
 temp.py
 newgateway.py
 Transactions/
+Transactions_*.zip
+# Frontend
+frontend-v2/node_modules/
+frontend-v2/dist/
+frontend-v2/.env
+frontend-v2/.env.*
+frontend-v2/src/modules/reconcilation.zip

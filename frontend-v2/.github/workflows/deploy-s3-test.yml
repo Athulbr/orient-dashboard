@@ -1,0 +1,77 @@
+name: Deploy Frontend (Dev) to S3
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build & Deploy Frontend to S3 (Dev Optimized)
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2️⃣ Setup Node
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 3️⃣ Install dependencies
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_READ_TOKEN: ${{ secrets.NPM_READ_TOKEN }}
+
+      # 4️⃣ Build frontend
+      - name: Build project
+        run: npm run build
+
+      # 5️⃣ Configure AWS credentials
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      #################################################################
+      # 🚀 OPTIMIZED DEPLOYMENT (SAFE + LOW COST)
+      #################################################################
+
+      # 6️⃣ Upload STATIC ASSETS (LONG CACHE, NO DELETE)
+      - name: Upload static assets
+        run: |
+          aws s3 sync dist/assets/ s3://${{ secrets.S3_BUCKET_NAME_DEV }}/assets/ \
+            --size-only \
+            --exclude "*.map" \
+            --cache-control "public,max-age=31536000,immutable"
+
+      # 7️⃣ Upload remaining files (NO DELETE)
+      - name: Upload remaining files
+        run: |
+          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME_DEV }} \
+            --size-only \
+            --exclude "assets/*" \
+            --exclude "index.html" \
+            --cache-control "public,max-age=86400"
+
+      # 8️⃣ Upload index.html (NO CACHE)
+      - name: Upload index.html
+        run: |
+          aws s3 cp dist/index.html s3://${{ secrets.S3_BUCKET_NAME_DEV }}/index.html \
+            --cache-control "no-cache,no-store,must-revalidate" \
+            --content-type "text/html"
+
+      # 9️⃣ Invalidate CloudFront cache (minimal)
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID_DEV }} \
+            --paths "/index.html" "/"

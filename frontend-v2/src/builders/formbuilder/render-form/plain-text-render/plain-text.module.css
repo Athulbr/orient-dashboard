@@ -1,0 +1,156 @@
+/* Input Field */
+.inputField {
+  width: 100%;
+  height: 100%;
+  border: none;
+  outline: none;
+  background-color: transparent;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  border-radius: 8px;
+}
+.inputField::-webkit-input-placeholder {
+  /* WebKit browsers */
+  color: #b1b1b1;
+}
+.inputField:disabled::-webkit-input-placeholder {
+  color: #cfcfcf;
+}
+/* Checkbox style */
+.checkboxLabel {
+  font-size: 1rem;
+  margin-left: 8px;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+.checkboxLabel:hover {
+  color: #2e86c1;
+}
+
+.hide {
+  visibility: hidden;
+}
+.checkboxInput {
+  height: 15px;
+  width: 15px;
+  min-width: 15px;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
+  border: 2px solid #2e86c1;
+  border-radius: 5px;
+  cursor: pointer;
+  margin-left: 10px;
+}
+.checkboxInput:checked {
+  background-color: #2e86c1;
+  border-color: #2e86c1;
+  box-shadow:
+    inset rgb(255, 255, 255) -2px -2px 0px 0px,
+    inset rgb(255, 255, 255) 2px 2px 0px 0px;
+}
+.disabled {
+  color: #cfcfcf;
+}
+.disabled:hover {
+  color: #cfcfcf;
+}
+/* signature style */
+.signatureLabel {
+  padding: 0 10px;
+  font-size: 0.9rem;
+  color: rgb(69, 69, 69);
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  cursor: pointer;
+  justify-content: space-between;
+}
+.signatureLabelButton {
+  padding: 5px 10px;
+  background-color: rgb(241, 241, 241);
+  border-radius: 5px;
+}
+.signatureLabelButton:hover {
+  background-color: rgb(234, 234, 234);
+  border-radius: 5px;
+}
+
+/* color style */
+
+.colorInputContainer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.previewContainer {
+  position: absolute;
+  top: -200px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 80%;
+  height: 200px;
+  border-radius: 6px;
+  box-shadow: 0px 2px 5px rgba(0, 0, 0, 0.2);
+  text-align: center;
+  line-height: 30px;
+  font-size: 12px;
+  color: white;
+  font-weight: bold;
+  z-index: 10;
+  transition: opacity 0.3s ease-in-out;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+}
+
+.inputsContainer {
+  display: flex;
+  height: 40px;
+}
+
+.buttonContainer {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-right: 8px;
+}
+
+.colorIconButton {
+  padding: 4px 10px;
+  background: lightgray;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: bold;
+  user-select: none;
+}
+
+.colorIconButton:hover {
+  background: darkgray;
+}
+
+/* file-upload  */
+
+/* .inputField[type='file'] {
+  display: none;
+} */
+.customFileWrapper {
+  display: flex;
+  align-items: center;
+  padding-left: 20px;
+  width: 100%;
+  font-size: 12px;
+}
+.customFileButton {
+  padding: 5px 10px;
+  background-color: rgb(241, 241, 241);
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.customFileButton:hover {
+  background-color: rgb(234, 234, 234);
+}

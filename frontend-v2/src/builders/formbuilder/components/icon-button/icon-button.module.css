@@ -1,0 +1,9 @@
+.iconButton {
+  padding: 8px 10px 4px;
+  background-color: rgb(255, 255, 255);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.iconButton:hover {
+  background-color: rgb(237, 237, 237);
+}

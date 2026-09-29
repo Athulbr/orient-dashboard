@@ -1,0 +1,55 @@
+.textFieldContainer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+}
+
+.label {
+  font-size: 1rem;
+  font-weight: 500;
+  color: #374151;
+  padding-left: 6px;
+}
+
+.inputWrapper {
+  position: relative;
+  width: 100%;
+}
+
+.input {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  font-size: 0.8rem;
+  line-height: 30px;
+  color: #1f2937;
+  background-color: white;
+  transition: border-color 0.15s ease-in-out;
+}
+
+.input:focus {
+  outline: none;
+  border: 1px solid rgb(188, 220, 231);
+  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.2);
+}
+
+.input:disabled {
+  background-color: #f3f4f6;
+  cursor: not-allowed;
+}
+
+.error .input {
+  border-color: #ef4444;
+}
+
+.error .input:focus {
+  box-shadow: 0 0 0 1px #ef4444;
+}
+
+.errorMessage {
+  font-size: 0.7rem;
+  color: #ef4444;
+  margin-top: 2px;
+}

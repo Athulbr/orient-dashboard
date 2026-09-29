@@ -1,0 +1,79 @@
+.overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 0.2s ease,
+    visibility 0.2s ease;
+}
+
+.overlayVisible {
+  opacity: 1;
+  visibility: visible;
+}
+
+.dialog {
+  background-color: white;
+  border-radius: 5px;
+  padding: 15px;
+  max-width: 500px;
+  width: 90%;
+  position: relative;
+  transform: translateY(-20px);
+  transition: transform 0.2s ease;
+}
+
+.overlayVisible .dialog {
+  transform: translateY(0);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  cursor: default;
+}
+
+.title {
+  font-size: 24px;
+  font-weight: 600;
+  color: #434343;
+  padding-left: 10px;
+}
+
+.closeButton {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 5px;
+  color: #666;
+  transition: color 0.2s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.closeButton:hover {
+  color: #1a1a1a;
+}
+
+.content {
+  color: #4a4a4a;
+}
+
+.footer {
+  margin-top: 20px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}

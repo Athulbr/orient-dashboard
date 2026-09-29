@@ -1,0 +1,53 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  padding: 0 10px;
+  gap: 5px;
+  min-height: 100px;
+}
+.label {
+  font-size: 0.9rem;
+  color: rgb(95, 95, 95);
+  font-weight: 500;
+  margin-left: 5px;
+}
+.labelDisabled {
+  color: rgb(201, 201, 201);
+}
+.inputWrapper {
+  border: 1px solid rgb(224, 224, 224);
+  min-height: 50px;
+  display: flex;
+  border-radius: 10px;
+  background-color: #ffffff;
+  padding: 2px 0;
+  align-items: center;
+}
+.inputWrapperDisabled {
+  border: 1px solid rgb(238, 238, 238);
+  background-color: #f9f9f9;
+}
+.focus {
+  border: 1px solid rgb(148, 212, 242);
+  box-shadow: 0 4px 8px rgba(0, 174, 255, 0.201);
+}
+.wrapperError {
+  border: 1px solid rgba(255, 0, 0, 0.512);
+  /* box-shadow: 0 4px 8px rgba(255, 0, 0, 0.096); */
+}
+.wrapperErrorFocus {
+  border: 1px solid rgba(255, 0, 0, 0.773);
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.1);
+  box-shadow: 0 4px 8px rgba(255, 0, 0, 0.148);
+}
+.errorMessage {
+  color: rgba(255, 0, 0, 0.81);
+  font-size: 0.8rem;
+  margin-left: 5px;
+  margin-bottom: 5px;
+  cursor: default;
+}
+.reducedHeight {
+  min-height: 50px;
+  height: 50px;
+}

@@ -1,0 +1,26 @@
+.track::-webkit-scrollbar {
+  width: 8px;
+  height: 6px;
+  display: block;
+}
+
+.track::-webkit-scrollbar-track {
+  background: #e5e5eb;
+}
+
+.track::-webkit-scrollbar-thumb {
+  background: #b3b3b7;
+  border-radius: 4px;
+}
+
+.track::-webkit-scrollbar-thumb:hover {
+  background: #484646;
+}
+
+.comparisonContainer input,
+.comparisonContainer textarea,
+.comparisonContainer select {
+  font-family: Consolas, Menlo, Monaco, 'Courier New', monospace;
+  font-variant-numeric: slashed-zero;
+  font-feature-settings: 'zero' 1;
+}

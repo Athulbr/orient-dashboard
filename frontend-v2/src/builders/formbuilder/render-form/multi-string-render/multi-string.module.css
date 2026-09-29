@@ -1,0 +1,78 @@
+.selectContainer {
+  position: relative;
+  width: 100%;
+  font-family: sans-serif;
+}
+
+.selectButton {
+  padding: 0 10px 0 5px;
+  border: none;
+  background-color: transparent;
+  border-radius: 4px;
+  display: flex;
+  gap: 5px;
+  justify-content: space-between;
+  align-items: center;
+  transition: border-color 0.2s;
+}
+
+.optionsContainer {
+  position: absolute;
+  top: 120%;
+  left: 0;
+  right: 0;
+  margin-top: 4px;
+  background-color: white;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  z-index: 1000;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.option {
+  padding: 8px 12px;
+  display: flex;
+  justify-content: space-between;
+  border-bottom: 1px solid lightgray;
+}
+.removeButton {
+  font-size: 0.7rem;
+  color: rgb(164, 164, 164);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background-color: rgb(237, 237, 237);
+}
+.removeButton:hover {
+  background-color: rgb(227, 226, 226);
+}
+
+.optionSelected {
+  background-color: #f0f0f0;
+}
+
+.optionSelected:hover {
+  background-color: #e5e7eb;
+}
+.addButton {
+  padding: 4px 6px;
+  background-color: rgb(232, 232, 232);
+  border-radius: 8px;
+  color: rgb(89, 89, 89);
+  cursor: pointer;
+}
+.addButton:hover {
+  background-color: rgb(220, 220, 220);
+}
+.inputField {
+  height: 100%;
+  width: 100%;
+  padding: 5px;
+  border: none;
+  outline: none;
+}
+.disabledButton {
+  color: lightgray;
+}

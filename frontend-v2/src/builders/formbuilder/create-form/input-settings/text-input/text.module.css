@@ -1,0 +1,29 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  height: 100%;
+  font-size: 0.9rem;
+  gap: 3px;
+}
+.inputLabel {
+  text-transform: capitalize;
+  padding-left: 2px;
+  margin-right: 10px;
+}
+.textInput {
+  padding: 7px 8px;
+  border-radius: 5px;
+  outline: none;
+  border: 1px solid #bdc3c7;
+  min-width: 180px;
+}
+.textInput:focus {
+  border: 1px solid rgb(188, 220, 231);
+  box-shadow: 0 4px 8px rgba(0, 123, 255, 0.2);
+}
+.inputLabel span {
+  font-size: 0.6rem;
+  color: gray;
+  margin-left: 2px;
+}

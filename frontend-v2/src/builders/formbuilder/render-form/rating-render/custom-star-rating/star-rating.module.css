@@ -1,0 +1,19 @@
+.starRating {
+  display: flex;
+  padding-left: 10px;
+}
+
+.star {
+  font-size: 1.6rem;
+  cursor: pointer;
+  transition: color 200ms;
+  padding-left: 5px;
+}
+
+.filled {
+  color: gold;
+}
+
+.empty {
+  color: lightgray;
+}

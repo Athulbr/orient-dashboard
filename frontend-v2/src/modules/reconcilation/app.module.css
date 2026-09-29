@@ -1,0 +1,101 @@
+/* ══════════════════════════════════════════════════════════════
+   RECONCILIATION — Platform-integrated styles
+   No standalone app shell. No scroll containers.
+   Scrolling is handled entirely by AuthenticatedLayout.
+   Font: DM Sans (platform global).
+   Colors: platform blue/gray palette.
+══════════════════════════════════════════════════════════════ */
+
+/* ── Results action bar (pill + back button) ─────────────────── */
+.pageHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* ── Error banner ────────────────────────────────────────────── */
+.appError {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+}
+
+.appErrorBody {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.appErrorTitle {
+  font-size: 13px;
+  font-weight: 700;
+  color: #991b1b;
+  flex-shrink: 0;
+}
+
+.appErrorMsg {
+  font-size: 13px;
+  color: #7f1d1d;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.appErrorClose {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid #fca5a5;
+  color: #991b1b;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.12s;
+}
+.appErrorClose:hover { background: #fee2e2; }
+
+/* ── Shared buttons ──────────────────────────────────────────── */
+.btnOutline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #ffffff;
+  color: #374151;
+  border: 1px solid #d1d5db;
+  padding: 7px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 7px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.btnOutline:hover { border-color: #2563eb; color: #2563eb; }
+
+/* ── Reconciliation mode pill ────────────────────────────────── */
+.reconModePill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: 99px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1.5px solid;
+  white-space: nowrap;
+}
+
+.reconModePillBank    { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+.reconModePillQr      { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }
+.reconModePillGateway { background: #eff6ff; border-color: #bfdbfe; color: #1e40af; }

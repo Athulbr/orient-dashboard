@@ -1,0 +1,24 @@
+.tableSearch {
+  border: 1px solid var(--grey-3);
+  cursor: pointer;
+  padding: 8px 20px;
+  border-radius: 100px;
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  font-weight: 400;
+  width: 180px;
+  height: 45px;
+}
+.tableSearch:hover {
+  border: 1px solid var(--primary);
+}
+.tableSearch input {
+  border: none;
+  outline: none;
+  width: 140px;
+}
+.tableSearch img {
+  height: 20px;
+  width: 20px;
+}

@@ -1,0 +1,36 @@
+/* Scrollbar CSS */
+.container {
+    overflow-x: scroll; /* Changed from auto to scroll - forces scrollbar to always show */
+    overflow-y: visible;
+    flex: 1;
+    display: block; /* Ensure block display for overflow to work */
+    max-width: 100%; /* Prevent container from expanding beyond parent */
+}
+
+/* Force scrollbar to always show */
+.container::-webkit-scrollbar {
+    height: 12px;
+    -webkit-appearance: none;
+}
+
+.container::-webkit-scrollbar-track {
+    border-radius: 4px;
+    background: #eeeeee;
+    border: 1px solid #d5d5d5;
+}
+
+.container::-webkit-scrollbar-thumb {
+    border-radius: 4px;
+    background: rgb(137, 137, 137);
+    border: 1px solid #d5d5d5;
+}
+
+.container::-webkit-scrollbar-thumb:hover {
+    background: rgb(100, 100, 100);
+}
+
+/* Firefox scrollbar */
+.container {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(137, 137, 137) #eeeeee;
+}

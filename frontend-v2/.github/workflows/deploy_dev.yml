@@ -1,0 +1,20 @@
+name: Deploy frontend-v2 OnPrem
+
+on:
+  push:
+    branches:
+      - orient-dev
+
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: rehab-mart/cicd-actions/.github/workflows/reusable-onprem-deploy.yml@main
+
+    with:
+      app_name: "frontend-v2"
+      app_port: "8080"
+      branch: "orient-dev"
+
+    secrets:
+      NPM_READ_TOKEN: ${{ secrets.NPM_READ_TOKEN }}

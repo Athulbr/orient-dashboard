@@ -1,0 +1,49 @@
+.container {
+  width: 100%;
+  padding: 10px 0 10px 5px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.inputTypesContainer {
+  border: 1px solid #e5e5e5;
+  border-radius: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px 10px;
+  background-color: white;
+  padding: 20px;
+}
+.addButton {
+  border: 1px solid #e5e5e5;
+  height: 45px;
+  font-size: 1rem;
+  gap: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background-color: white;
+  cursor: pointer;
+  max-width: 200px;
+}
+.addButton:hover {
+  background-color: rgb(241, 241, 241);
+}
+.iconTypeButton {
+  border: 1px solid #e5e5e5;
+  padding: 0 25px 0 20px;
+  height: 45px;
+  font-size: 1rem;
+  gap: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background-color: white;
+  cursor: pointer;
+  text-transform: capitalize;
+}
+.iconTypeButton:hover {
+  background-color: rgb(241, 241, 241);
+}

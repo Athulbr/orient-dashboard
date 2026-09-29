@@ -1,0 +1,23 @@
+.signaturePadContainer {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+}
+
+.signatureCanvas {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+  touch-action: none;
+  cursor: crosshair;
+  width: 100%;
+  width: 400px;
+}
+
+.buttonBox {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}

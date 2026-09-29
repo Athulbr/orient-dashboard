@@ -1,0 +1,42 @@
+/* Spinner.module.css */
+
+.spinner {
+  display: inline-block;
+  position: relative;
+  width: 20px;
+  height: 20px;
+}
+
+.inner {
+  box-sizing: border-box;
+  display: block;
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  margin: 2px;
+  border: 2px solid #e6e6e6;
+  border-radius: 50%;
+  animation: rotate 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+  border-color: #ccc transparent rgb(0, 255, 0) transparent;
+}
+.largeInner {
+  box-sizing: border-box;
+  display: block;
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  margin: 3%;
+  border: 3px solid #e6e6e6;
+  border-radius: 50%;
+  animation: rotate 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+  border-color: #ccc transparent rgb(0, 255, 0) transparent;
+}
+
+@keyframes rotate {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}

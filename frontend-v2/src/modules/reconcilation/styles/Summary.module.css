@@ -1,0 +1,318 @@
+.summary-container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* ── Status bar ── */
+.status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-radius: 7px;
+  font-size: 13.5px;
+  font-weight: 500;
+  gap: 16px;
+}
+
+.status-bar--ok {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+}
+
+.status-bar--pending {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+}
+
+.status-bar__label {
+  color: inherit;
+  font-weight: 600;
+}
+
+.status-bar--ok .status-bar__label      { color: #15803d; }
+.status-bar--pending .status-bar__label { color: #991b1b; }
+
+.status-bar__value {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-bar--ok .status-bar__value      { color: #16a34a; }
+.status-bar--pending .status-bar__value { color: #dc2626; }
+
+/* ── KPI grid ── */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+}
+
+@media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3, 1fr); } }
+@media (max-width: 600px)  { .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+
+.kpi-card {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.kpi-card--green { background: #f0fdf4; border-color: #bbf7d0; }
+.kpi-card--amber { background: #fffbeb; border-color: #fde68a; }
+.kpi-card--red   { background: #fef2f2; border-color: #fecaca; }
+
+.kpi-card__label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #6b7280;
+}
+
+.kpi-card--green .kpi-card__label { color: #15803d; }
+.kpi-card--amber .kpi-card__label { color: #92400e; }
+.kpi-card--red   .kpi-card__label { color: #991b1b; }
+
+.kpi-card__value {
+  font-size: 28px;
+  font-weight: 700;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.kpi-card__value--sm { font-size: 17px; }
+
+.kpi-card--green .kpi-card__value { color: #15803d; }
+.kpi-card--amber .kpi-card__value { color: #92400e; }
+.kpi-card--red   .kpi-card__value { color: #991b1b; }
+
+/* ── Panels ── */
+.summary-panel {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+
+.panel-heading {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6b7280;
+  margin: 0 0 14px;
+}
+
+/* ── Match progress ── */
+.match-rate-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.match-progress {
+  flex: 1;
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 99px;
+  overflow: hidden;
+}
+
+.match-progress__fill {
+  height: 100%;
+  background: #16a34a;
+  border-radius: 99px;
+  transition: width 0.5s ease;
+}
+
+/* colour variants */
+.match-progress__fill--high { background: #16a34a; }
+.match-progress__fill--mid  { background: #d97706; }
+.match-progress__fill--low  { background: #dc2626; }
+
+.match-pct {
+  font-size: 13px;
+  font-weight: 700;
+  color: #16a34a;
+  min-width: 42px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.match-pct--high { color: #16a34a; }
+.match-pct--mid  { color: #d97706; }
+.match-pct--low  { color: #dc2626; }
+
+.match-rate-note {
+  font-size: 12px;
+  color: #6b7280;
+  margin: -10px 0 12px;
+  line-height: 1.5;
+}
+
+.score-weight {
+  font-size: 10.5px;
+  color: #9ca3af;
+  font-weight: 400;
+  margin-left: 4px;
+}
+
+/* ── Breakdown table ── */
+.breakdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+}
+
+.breakdown-table td {
+  padding: 6px 0;
+  border-bottom: 1px solid #e5e7eb;
+  color: #374151;
+}
+
+.breakdown-table tr:last-child td {
+  border-bottom: none;
+}
+
+.breakdown-table__val {
+  text-align: right;
+  font-weight: 600;
+  color: #111827;
+  font-variant-numeric: tabular-nums;
+}
+
+.val--amber { color: #92400e; }
+.val--red   { color: #991b1b; }
+
+/* ── Next steps ── */
+.next-steps {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  counter-reset: steps;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.next-step {
+  counter-increment: steps;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 11px 14px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: #374151;
+}
+
+.next-step::before {
+  content: counter(steps);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  background: #e5e7eb;
+  color: #374151;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 700;
+  margin-top: 1px;
+}
+
+.next-step--urgent {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #7f1d1d;
+}
+
+.next-step--urgent::before {
+  background: #fecaca;
+  color: #991b1b;
+}
+
+/* ── BRS Balance Summary table ────────────────────────────────────────────── */
+.brs-balance-table { margin-top: 4px; }
+
+.brs-balance-table td:first-child {
+  font-size: 13px;
+  color: #374151;
+  padding: 7px 0;
+}
+
+/* Amount column */
+.brs-balance-table .breakdown-table__val {
+  min-width: 140px;
+  padding: 7px 0 7px 16px;
+}
+
+/* Add rows — green */
+.val--add {
+  color: #15803d;
+  font-weight: 600;
+}
+
+/* Less rows — red */
+.val--less {
+  color: #b91c1c;
+  font-weight: 600;
+}
+
+/* Opening balance row */
+.brs-row-opening td {
+  font-weight: 600;
+  padding-top: 2px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+/* Reconciled subtotal row */
+.brs-row-subtotal td {
+  padding-top: 10px;
+  padding-bottom: 10px;
+  border-top: 2px solid #2563eb;
+  border-bottom: 2px solid #2563eb;
+  background: #eff6ff;
+  font-size: 13.5px;
+}
+
+/* Bank closing balance row */
+.brs-row-bank td {
+  color: #1d4ed8;
+  font-weight: 600;
+  padding-top: 10px;
+}
+
+/* Difference row — fully reconciled (green) */
+.brs-row-ok td {
+  padding-top: 8px;
+  padding-bottom: 2px;
+  background: #f0fdf4;
+  color: #15803d;
+  font-size: 13.5px;
+  border-top: 2px solid #86efac;
+  border-radius: 0 0 4px 4px;
+}
+
+/* Difference row — gap exists (red) */
+.brs-row-err td {
+  padding-top: 8px;
+  padding-bottom: 2px;
+  background: #fef2f2;
+  color: #be123c;
+  font-size: 13.5px;
+  border-top: 2px solid #fda4af;
+  border-radius: 0 0 4px 4px;
+}
