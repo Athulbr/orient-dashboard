@@ -495,22 +495,15 @@ def process_gateway_files(
             values = list(value)
         return [Path(f) for f in values if f]
 
-    def _limit_gateway_files(paths, label, max_files=4):
-        if len(paths) > max_files:
-            raise ValueError(
-                f"{label} accepts a maximum of {max_files} file(s); "
-                f"received {len(paths)}."
-            )
-        return paths
-
+    
     ALL_BRANCHES_FILE = Path(all_branches_path)
     HOT_BOOK_FILE     = Path(hot_book_path)
     STATEMENT_FILE    = Path(statement_path)
-    PAYU_FILES        = _limit_gateway_files(_as_path_list(payu_paths), "PayU")
-    PAYU_OD_FILES     = _limit_gateway_files(_as_path_list(payu_od_paths), "PayU On-Demand")
-    CASHFREE_FILES    = _limit_gateway_files(_as_path_list(cashfree_path), "Cashfree")
-    EASEBUZZ_FILES    = _limit_gateway_files(_as_path_list(easebuzz_paths), "EaseBuzz")
-    SMART_PAY_FILES   = _limit_gateway_files(_as_path_list(smart_pay_paths), "Smart Pay")
+    PAYU_FILES        = _as_path_list(payu_paths)
+    PAYU_OD_FILES     = _as_path_list(payu_od_paths)
+    CASHFREE_FILES    = _as_path_list(cashfree_path)
+    EASEBUZZ_FILES    = _as_path_list(easebuzz_paths)
+    SMART_PAY_FILES   = _as_path_list(smart_pay_paths)
     PREV_BRS_FILE     = Path(prev_brs_path)  if prev_brs_path  else None
     CNB_UTRS_FILE     = Path(cnb_utrs_path)  if cnb_utrs_path  else None
     NAME_MATCH_DIRECT_FILE = Path(name_match_direct_path) if name_match_direct_path else None
