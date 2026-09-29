@@ -858,6 +858,17 @@ def process_gateway_files(
         return True
     
     def _build_gateway_customer_pool(payu_df, cf_rows, eb_info=None):
+        # Uses _gateway_party_for_name_match (defined further down, once
+        # total_order_lookup/name_report_lookup are loaded) so that DNC
+        # exclusion applies the SAME bank-verification check the Matched
+        # sheet's own verdict logic already uses -- previously this pool used
+        # the raw, self-entered "Customer Name" only, with no cross-check
+        # against PayU's own Bank Account Verification result. That let a
+        # book bill get excluded from DNC purely because a self-entered name
+        # happened to match, even when PayU's own BAV flagged the actual
+        # paying bank account as belonging to someone else entirely -- while
+        # the Matched sheet (which does check this) correctly refused to
+        # call it a match, so the bill vanished from both DNC and Matched.
         pool = []
         if not payu_df.empty:
             payu_pos = payu_df[
@@ -867,10 +878,11 @@ def process_gateway_files(
                 amt = float(row.get("Amount", 0.0) or 0.0)
                 if amt <= 0:
                     continue
+                txn_id = str(row.get("Merchant Txn ID", "")).strip()
                 pool.append(dict(
                     amount=amt,
-                    party=str(row.get("Customer Name", "")).strip(),
-                    ref=str(row.get("Merchant Txn ID", "")).strip(),
+                    party=_gateway_party_for_name_match(txn_id, amt, row.get("Customer Name", "")),
+                    ref=txn_id,
                     date=_coerce_ts(row.get("Settlement Date") or row.get("AddedOn")),
                     gateway="PAYU",
                 ))
@@ -887,10 +899,11 @@ def process_gateway_files(
                         or detail.get("cashfree_ref")
                         or row.get("id", "")
                     )
+                    ref = str(ref).strip()
                     pool.append(dict(
                         amount=amt,
-                        party=str(detail.get("customer_name", "") or ref).strip(),
-                        ref=str(ref).strip(),
+                        party=_gateway_party_for_name_match(ref, amt, detail.get("customer_name", "") or ref),
+                        ref=ref,
                         date=_coerce_ts(detail.get("settlement_date") or detail.get("event_time")),
                         gateway="CASHFREE",
                     ))
@@ -912,7 +925,7 @@ def process_gateway_files(
             )
             if pd.isna(amt) or float(amt) <= 0:
                 continue
-            party = (
+            raw_party = (
                 row.get("Name")
                 or row.get("Customer Name")
                 or row.get("Firstname")
@@ -927,15 +940,24 @@ def process_gateway_files(
                 or row.get("Txn ID")
                 or ""
             )
+            ref = str(ref).strip()
             pool.append(dict(
                 amount=float(amt),
-                party=str(party).strip(),
-                ref=str(ref).strip(),
-                date=_coerce_ts(
-                    row.get("AddedOn")
-                    or row.get("Date")
-                    or row.get("Created At")
-                    or row.get("Transaction Date")
+                party=_gateway_party_for_name_match(ref, float(amt), raw_party),
+                ref=ref,
+                # Same fix as EaseBuzz's CNB-item date and the Cheque
+                # Deposits narration date: EaseBuzz settles with a lag, so
+                # the raw transaction date (when the customer paid) is
+                # often a day or more before the bank actually credited the
+                # settlement. Look up the real bank credit date first.
+                date=(
+                    _fmt_bank_settlement_date(row.get("_settlement_ref", "") or ref)
+                    or _coerce_ts(
+                        row.get("AddedOn")
+                        or row.get("Date")
+                        or row.get("Created At")
+                        or row.get("Transaction Date")
+                    )
                 ),
                 gateway="EASEBUZZ",
             ))
@@ -1736,6 +1758,25 @@ def process_gateway_files(
             v = row[c]
             return v if pd.notna(v) else None
 
+        def _parse_amount(value):
+            # Some exports of this statement give plain numeric cells;
+            # others (like this one) give text with comma thousands
+            # separators and padding whitespace (e.g.
+            # "                                 124,373.00"), which
+            # float() can't parse directly. Handle both without assuming
+            # either.
+            if value is None:
+                return 0.0
+            if isinstance(value, (int, float)):
+                return float(value)
+            text = str(value).strip().replace(",", "")
+            if not text:
+                return 0.0
+            try:
+                return float(text)
+            except ValueError:
+                return 0.0
+
         bank_txns      = []
         credits_by_ref = {}
         seen_refs      = set()
@@ -1760,10 +1801,9 @@ def process_gateway_files(
 
             description = str(_cell(row, "Transaction Description") or "").strip()
             ref_raw = str(_cell(row, "Reference No") or "").strip()
-            debit  = float(_cell(row, "Debit Amount") or 0.0)
-            credit = float(_cell(row, "Credit Amount") or 0.0)
-            running_val = _cell(row, "Running Balance")
-            running = float(running_val) if running_val is not None else 0.0
+            debit  = _parse_amount(_cell(row, "Debit Amount"))
+            credit = _parse_amount(_cell(row, "Credit Amount"))
+            running = _parse_amount(_cell(row, "Running Balance"))
 
             ref = ref_raw or None
             source = "OTHER"
@@ -1825,8 +1865,28 @@ def process_gateway_files(
     
         suc = df[df["Status"] == "SUCCESS"].copy()
         ref = df[df["Amount(Net)"] <= 0].copy()
-    
-        groups = (suc.groupby("Merchant UTR", dropna=False)
+
+        # For the aggregate settlement-vs-bank-credit comparison specifically
+        # (not for anything else that reads `suc`), a refund PayU still shows
+        # as "requested" -- its status hasn't flipped to a final state yet --
+        # can already be reflected in what the bank actually credited for
+        # that settlement. The bank settles on its own schedule and doesn't
+        # wait for PayU's internal status workflow to catch up. Excluding
+        # such rows understates the aggregate Net figure, producing a false
+        # "MISMATCH" against the real bank credit even though the bank has
+        # already correctly netted the refund out.
+        _requested_action_col = df.get("Requested Action", pd.Series("", index=df.index))
+        refund_in_progress = df[
+            (df["Status"] != "SUCCESS")
+            & (df["Amount(Net)"] < 0)
+            & (_requested_action_col.astype(str).str.upper().str.contains("REFUND", na=False))
+        ].copy()
+        settlement_calc_df = (
+            pd.concat([suc, refund_in_progress], ignore_index=True)
+            if not refund_in_progress.empty else suc
+        )
+
+        groups = (settlement_calc_df.groupby("Merchant UTR", dropna=False)
                    .agg(txn_count    =("Amount",               "count"),
                         gross        =("Amount",               lambda s: s[s > 0].sum()),
                         net          =("Amount(Net)",          "sum"),
@@ -1834,7 +1894,7 @@ def process_gateway_files(
                         svc_tax      =("Total Service Tax",    "sum"))
                    .reset_index())
         groups["fees_total"] = groups["proc_fees"] + groups["svc_tax"]
-        return suc, ref, groups
+        return suc, ref, groups, refund_in_progress
     
     def load_payu_on_demand(od_files):
         frames = []
@@ -2030,7 +2090,9 @@ def process_gateway_files(
             lines = f.readlines()
         info = {}
         txns = []
+        refunds = []
         in_txn = False; txn_hdr = None
+        in_refund = False; refund_hdr = None
         for line in lines:
             raw   = line.strip()
             parts = [p.strip().strip('"') for p in raw.split('","')]
@@ -2053,22 +2115,36 @@ def process_gateway_files(
                 if "Total GST" in second_last:
                     try: info["total_gst"] = float(last_val)
                     except: pass
+                if "Refunded Amount" in second_last:
+                    try: info["total_refunded"] = float(last_val)
+                    except: pass
     
-            if not parts[0]: in_txn = False; continue
-            if parts[0] == "SETTLED TRANSACTIONS": in_txn = True; txn_hdr = None; continue
+            if not parts[0]:
+                in_txn = False; in_refund = False; continue
+            if parts[0] == "SETTLED TRANSACTIONS": in_txn = True; in_refund = False; txn_hdr = None; continue
+            if parts[0] == "REFUND TRANSACTIONS": in_refund = True; in_txn = False; refund_hdr = None; continue
+            if parts[0] == "No Refunds In This Settlement": in_refund = False; continue
             if in_txn and txn_hdr is None and parts[0] == "#":
                 txn_hdr = parts; continue
             if in_txn and txn_hdr and parts[0].isdigit():
                 txns.append(dict(zip(txn_hdr, parts)))
+            if in_refund and refund_hdr is None and parts[0] == "#":
+                refund_hdr = parts; continue
+            if in_refund and refund_hdr and parts[0].isdigit():
+                refunds.append(dict(zip(refund_hdr, parts)))
         info["txns"] = txns
+        info["refunds"] = refunds
         info["fees_total"] = info.get("total_charge", 0.0) + info.get("total_gst", 0.0)
         return info
 
     def load_smart_pay(path):
         """YES Bank Smart Pay collection report. Same shape as PayU: a flat
         per-transaction list, not a settlement-batch report like CashFree.
-        Only rows with Status == 'Paid' and a Unique ID starting with 'DP'
-        are genuine customer collections we should reconcile.
+        Only rows with Status == 'Paid' are genuine customer collections we
+        should reconcile. Unique ID format isn't consistent across exports
+        (some are "DP"-prefixed, others are plain numeric order-number-style
+        IDs) so Status is the only reliable filter -- an ID-prefix
+        requirement here would silently drop genuinely paid transactions.
         """
         xl = _safe_excel_file(path)
 
@@ -2098,7 +2174,6 @@ def process_gateway_files(
         settlement_utr_col = colmap.get("settlementutr")
 
         df = df[df[status_col].astype(str).str.strip().str.upper() == "PAID"]
-        df = df[df[id_col].astype(str).str.strip().str.upper().str.startswith("DP", na=False)]
 
         rows = []
         for _, r in df.iterrows():
@@ -2512,18 +2587,33 @@ def process_gateway_files(
     closing_bal  = float(hot_sum_rows.iloc[0][11]) if len(hot_sum_rows) > 0 else 0.0
     
     # Load all PAYU files and combine
-    _payu_suc_frames = []; _payu_ref_frames = []; _payu_group_frames = []
+    _payu_suc_frames = []; _payu_ref_frames = []; _payu_group_frames = []; _payu_refund_progress_frames = []
     for _pf in PAYU_FILES:
-        _s, _r, _g = load_payu_regular(_pf)
+        _s, _r, _g, _rip = load_payu_regular(_pf)
         _payu_suc_frames.append(_s)
         _payu_ref_frames.append(_r)
         _payu_group_frames.append(_g)
+        _payu_refund_progress_frames.append(_rip)
     payu_suc = pd.concat(_payu_suc_frames, ignore_index=True) if _payu_suc_frames else pd.DataFrame()
     payu_ref_rows = pd.concat(_payu_ref_frames, ignore_index=True) if _payu_ref_frames else pd.DataFrame()
+    payu_refund_in_progress = (
+        pd.concat(_payu_refund_progress_frames, ignore_index=True)
+        if _payu_refund_progress_frames else pd.DataFrame()
+    )
     # Re-aggregate groups after combining multiple files
     if not payu_suc.empty:
         payu_suc_ok = payu_suc[payu_suc["Status"].astype(str).str.strip().str.upper() == "SUCCESS"].copy()
-        payu_groups = (payu_suc_ok.groupby("Merchant UTR", dropna=False)
+        # Same reasoning as inside load_payu_regular: a refund still shown as
+        # "requested" can already be reflected in the actual bank credit for
+        # this settlement, so it needs to be included here too -- payu_suc
+        # itself stays SUCCESS-only (it's used for per-transaction matching
+        # elsewhere, where an unconfirmed refund shouldn't count as a real
+        # transaction), only this aggregate calculation needs the wider set.
+        _settlement_calc_df = (
+            pd.concat([payu_suc_ok, payu_refund_in_progress], ignore_index=True)
+            if not payu_refund_in_progress.empty else payu_suc_ok
+        )
+        payu_groups = (_settlement_calc_df.groupby("Merchant UTR", dropna=False)
                        .agg(txn_count    =("Amount",               "count"),
                             gross        =("Amount",               lambda s: s[s > 0].sum()),
                             net          =("Amount(Net)",          "sum"),
@@ -2598,7 +2688,7 @@ def process_gateway_files(
     eb_gross = eb_net = eb_charge = eb_gst = 0.0
     eb_settlements = []  # one entry per EaseBuzz settlement file/reference
     if EASEBUZZ_FILES:
-        _eb_txns_all = []; _eb_neft_ref = ""; _eb_total_amount = 0.0
+        _eb_txns_all = []; _eb_refunds_all = []; _eb_neft_ref = ""; _eb_total_amount = 0.0
         _eb_total_payable = 0.0; _eb_total_charge = 0.0; _eb_total_gst = 0.0
         for _ef in EASEBUZZ_FILES:
             _ebi = load_easebuzz(_ef)
@@ -2610,6 +2700,9 @@ def process_gateway_files(
                 # tell whether *that* settlement actually reached the bank.
                 _t["_settlement_ref"] = _ref
             _eb_txns_all.extend(_file_txns)
+            for _rf in _ebi.get("refunds", []):
+                _rf["_settlement_ref"] = _ref
+            _eb_refunds_all.extend(_ebi.get("refunds", []))
             if not _eb_neft_ref:
                 _eb_neft_ref = _ref
             _amt = float(_ebi.get("total_amount",  0.0) or 0.0)
@@ -2633,6 +2726,7 @@ def process_gateway_files(
         eb_info = {
             "neft_ref":      _eb_neft_ref,
             "txns":          _eb_txns_all,
+            "refunds":       _eb_refunds_all,
             "total_amount":  _eb_total_amount,
             "total_payable": _eb_total_payable,
             "total_charge":  _eb_total_charge,
@@ -2994,6 +3088,7 @@ def process_gateway_files(
                     all_cnb_new.append(dict(
                         date=dt, branch="HOT", utr=utr,
                         party=party, amount=amt,
+                        pg_party=str(_gateway_extra_info(utr, amt)[3] or "").strip(),
                         remark="Prior-day PayU txn -- credited in bank today, not yet in book",
                         gateway="PAYU-GW", cf=False, _auto=True,
                     ))
@@ -3558,6 +3653,7 @@ def process_gateway_files(
                 branch=_branch or "PAYU",
                 utr=txn_id,
                 party=str(row.get("Customer Name", "")).strip() or "PAYU",
+                pg_party=str(_bank_name or "").strip(),
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
@@ -3596,7 +3692,12 @@ def process_gateway_files(
                 txn_id=txn_id,
                 amount=amt,
                 party=str(detail.get("customer_name", "") or "CASHFREE").strip(),
-                date=_coerce_ts(detail.get("event_time") or detail.get("settlement_date") or r.get("settlement_date")),
+                # Prefer the actual settlement date (when CashFree transferred
+                # the money to the bank) over the individual transaction's own
+                # event_time (when the customer paid) -- CashFree settles with
+                # a lag, so using event_time here showed the wrong "credited
+                # on" date for backdated matches.
+                date=_coerce_ts(detail.get("settlement_date") or r.get("settlement_date") or detail.get("event_time")),
                 settlement_utr=str(r.get("utr", "")).strip(),
             ))
 
@@ -3627,6 +3728,7 @@ def process_gateway_files(
                 branch=(_gateway_extra_info(txn_id, amt)[2] or "CASHFREE"),
                 utr=txn_id,
                 party=detail_item["party"],
+                pg_party=str(_gateway_extra_info(txn_id, amt)[3] or "").strip(),
                 amount=amt,
                 remark="Auto CNB -- CashFree reconciliation-detail txn credited in bank, not in book",
                 gateway="CASHFREE-GW",
@@ -3669,16 +3771,23 @@ def process_gateway_files(
         if not txn_id or pd.isna(amt) or float(amt) <= 0:
             continue
         dt = _coerce_ts(_et.get("Transaction Date"))
+        # Same fix as PayU's own CNB date: EaseBuzz settles with a lag, so
+        # the raw "Transaction Date" (when the customer paid) can be a day
+        # or more before the bank actually credited the settlement. Look up
+        # the real bank credit date for this settlement first, and only
+        # fall back to the transaction date if that lookup comes up empty.
+        bank_credit_date = _fmt_bank_settlement_date(_et.get("_settlement_ref", "") or txn_id)
         if dt is not None and not pd.isna(dt) and dt.normalize() > brs_dt_ts.normalize():
             continue
         if _norm(txn_id) in cnb_ids or _norm(txn_id) in less2_ids:
             continue
         party = _et.get("Customer Name") or "EASEBUZZ"
         item = dict(
-            date=(dt.strftime("%d.%m.%Y") if dt is not None and not pd.isna(dt) else BRS_DATE),
+            date=(bank_credit_date or (dt.strftime("%d.%m.%Y") if dt is not None and not pd.isna(dt) else BRS_DATE)),
             branch=(_gateway_extra_info(txn_id, amt)[2] or "EASEBUZZ"),
             utr=txn_id,
             party=str(party).strip(),
+            pg_party=str(_gateway_extra_info(txn_id, amt)[3] or "").strip(),
             amount=float(amt),
             remark="Auto CNB -- EaseBuzz txn settled in bank, not in book",
             gateway="EASEBUZZ-GW",
@@ -3724,6 +3833,7 @@ def process_gateway_files(
             branch=(_gateway_extra_info(txn_id, amt)[2] or "SMARTPAY"),
             utr=txn_id,
             party=str(party).strip(),
+            pg_party=str(_gateway_extra_info(txn_id, amt)[3] or "").strip(),
             amount=amt,
             remark="Auto CNB -- Smart Pay txn paid, not in book",
             gateway="SMARTPAY-GW",
@@ -3858,9 +3968,20 @@ def process_gateway_files(
     # shift the reconciled balance rather than just making an
     # already-accounted-for event visible on both sides.
     if not payu_suc.empty:
+        # Same reasoning as the aggregate settlement fix earlier: a refund
+        # PayU still shows as "requested" (not yet SUCCESS) can already be
+        # reflected in what the bank actually debited -- the bank doesn't
+        # wait for PayU's internal status to catch up. Excluding these here
+        # meant a genuinely-already-refunded amount (like Chandra
+        # Sampathkumar's) never got its Less2 entry, even though the
+        # aggregate-level fix already accounted for it in the settlement
+        # total. payu_refund_in_progress (built during PayU file loading)
+        # carries exactly these rows.
         _refund_rows = payu_suc[
             pd.to_numeric(payu_suc.get("Amount(Net)", pd.Series(dtype=float)), errors="coerce").fillna(0) < 0
         ].copy()
+        if not payu_refund_in_progress.empty:
+            _refund_rows = pd.concat([_refund_rows, payu_refund_in_progress], ignore_index=True)
         for _, row in _refund_rows.iterrows():
             utr = str(row.get("Merchant Txn ID", "")).strip()
             if re.fullmatch(r"OND_(\d+)", utr, flags=re.IGNORECASE):
@@ -3870,12 +3991,60 @@ def process_gateway_files(
                 continue
             party = str(row.get("Customer Name", "")).strip()
             probe = dict(party=party, amount=refund_amt)
-            if not _matches_section_by_name_amount(probe, cnb_all, amount_tol=1.0):
-                continue
+            gross_amt = round(float(row.get("Amount", 0.0) or 0.0), 2)
+            has_cnb_pair = _matches_section_by_name_amount(probe, cnb_all, amount_tol=1.0)
+            if not has_cnb_pair:
+                # No existing CNB entry to pair against -- this is the
+                # "test payment" pattern (e.g. a Rs 5/Rs 7 gateway test that
+                # gets refunded immediately): the row's own Amount(Net) is
+                # already negative, so it never enters the normal "create a
+                # CNB credit" pass (which only looks at positive
+                # Amount(Net)), and with no CNB entry existing, the pairing
+                # check above always fails too -- so both sides were
+                # silently invisible even though real money genuinely moved
+                # both ways through the bank.
+                #
+                # Scoped deliberately to small amounts only (<= Rs 1,000).
+                # Larger refunds are far more likely to be a genuine
+                # customer transaction that already has its own book
+                # counterpart handled elsewhere (verified directly: a
+                # Rs 14,669 case here turned out to already be correctly
+                # matched via the backdated-clearing path under a
+                # different, bank-verified name -- name-based matching
+                # alone isn't a reliable enough signal to rule that out for
+                # larger amounts, and duplicating an already-correct match
+                # is worse than leaving a genuine gap unfixed).
+                if gross_amt <= 0 or gross_amt > 1000:
+                    continue
+                _gross_probe = dict(party=party, amount=gross_amt)
+                if _is_book_resolved(_gross_probe, book_evidence_rows):
+                    continue
+                if _norm(utr) in cnb_ids or _norm(utr) in less2_ids:
+                    continue
+                _added_on = _coerce_ts(row.get("AddedOn"))
+                cnb_all.append(dict(
+                    date=(_added_on.strftime("%d.%m.%Y") if _added_on is not None and not pd.isna(_added_on) else BRS_DATE),
+                    branch=(_gateway_extra_info(utr, gross_amt)[2] or "PAYU"),
+                    utr=utr,
+                    party=party or "PAYU",
+                    pg_party=str(_gateway_extra_info(utr, gross_amt)[3] or "").strip(),
+                    amount=gross_amt,
+                    remark="Auto CNB -- PayU txn settled in bank, not in book",
+                    gateway="PAYU-GW",
+                    cf=False, _auto=True,
+                ))
+                cnb_ids.add(_norm(utr))
             refund_key = f"{utr}-REFUND"
             if _norm(refund_key) in less2_ids:
                 continue
-            dt = _coerce_ts(row.get("SucceedOn") or row.get("Settlement Date") or row.get("AddedOn"))
+            # "SucceedOn" is meaningless for a transaction that never
+            # actually reached SUCCESS (PayU fills it with a placeholder
+            # epoch date, "1972-01-01" -- exactly Chandra Sampathkumar's
+            # case here). "Settlement Date" reflects the real bank event
+            # either way, so check it first.
+            dt = _coerce_ts(row.get("Settlement Date") or row.get("SucceedOn") or row.get("AddedOn"))
+            if dt is not None and not pd.isna(dt) and dt.year < 2000:
+                dt = _coerce_ts(row.get("AddedOn"))
             _add_less2(dict(
                 date=dt.strftime("%d.%m.%Y") if dt is not None and not pd.isna(dt) else BRS_DATE,
                 branch=(_gateway_extra_info(utr, refund_amt)[2] or "PAYU"),
@@ -4010,6 +4179,7 @@ def process_gateway_files(
                         branch=(_gateway_extra_info(d["ref"], d["amount"])[2] or "CASHFREE"),
                         utr=d["ref"] or settlement_utr,
                         party=d["party"],
+                        pg_party=str(_gateway_extra_info(d["ref"], d["amount"])[3] or "").strip(),
                         amount=d["amount"],
                         remark="CashFree collected -- no book entry, settlement still pending bank credit",
                         gateway="CASHFREE-GW",
@@ -4105,6 +4275,7 @@ def process_gateway_files(
                 branch=(_gateway_extra_info(txn_id, amt)[2] or "PAYU"),
                 utr=txn_id,
                 party=str(row.get("Customer Name", "")).strip() or "PAYU",
+                pg_party=str(_gateway_extra_info(txn_id, amt)[3] or "").strip(),
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
@@ -4155,6 +4326,7 @@ def process_gateway_files(
                 branch=(_gateway_extra_info(txn_id, amt)[2] or "PAYU"),
                 utr=txn_id,
                 party=str(row.get("Customer Name", "")).strip() or "PAYU",
+                pg_party=str(_gateway_extra_info(txn_id, amt)[3] or "").strip(),
                 amount=amt,
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
@@ -4220,6 +4392,7 @@ def process_gateway_files(
                 branch="PAYU",
                 utr=str(row.get("Merchant Txn ID", "")).strip(),
                 party=str(row.get("Customer Name", "")).strip() or "PAYU",
+                pg_party=str(_gateway_extra_info(row.get("Merchant Txn ID", ""), row.get("Amount", 0.0))[3] or "").strip(),
                 amount=float(row.get("Amount", 0.0) or 0.0),
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
@@ -4231,6 +4404,7 @@ def process_gateway_files(
                 branch="CASHFREE",
                 utr="20260311636895",
                 party="Harshithaaaa",
+                pg_party=str(_gateway_extra_info("20260311636895", 33.0)[3] or "").strip(),
                 amount=33.0,
                 remark="Auto CNB -- CashFree txn credited in bank, not in book",
                 gateway="CASHFREE-GW",
@@ -4320,6 +4494,7 @@ def process_gateway_files(
                 branch="PAYU",
                 utr=str(row.get("Merchant Txn ID", "")).strip(),
                 party=str(row.get("Customer Name", "")).strip() or "PAYU",
+                pg_party=str(_gateway_extra_info(row.get("Merchant Txn ID", ""), row.get("Amount", 0.0))[3] or "").strip(),
                 amount=float(row.get("Amount", 0.0) or 0.0),
                 remark="Auto CNB -- PayU txn settled in bank, not in book",
                 gateway="PAYU-GW",
@@ -4384,15 +4559,26 @@ def process_gateway_files(
         s = re.sub(r"[^A-Z0-9]", "", str(v or "").upper())
         return s[2:] if s.startswith("PS") else s
 
-    def _bill_key(branch, bill):
+    def _bill_key(branch, bill, amount=None):
         # Bill numbers are only guaranteed unique WITHIN a branch -- the same
         # bill number can (and does) legitimately occur in two different
         # branches (e.g. "PS-6203039" existing separately in both PUNE and
-        # VADO). Keying purely by bill number caused one branch's book bill
-        # to be silently matched against a completely different branch's
-        # bank credit. Every dict that cross-references "this bill" now
-        # keys on (branch, bill) together to keep them properly isolated.
-        return f"{str(branch or '').strip().upper()}::{_norm_bill(bill)}"
+        # VADO). It can ALSO occur twice within the SAME branch for the SAME
+        # customer -- a genuine source-data duplication (e.g. "PS-6205374"
+        # appearing twice for "Neha Arora" with two different amounts,
+        # 87,450 and 190,000, each with its own separate bank match). Without
+        # amount as a third differentiator, both rows collide on the same key
+        # and whichever is processed last silently overwrites the other's
+        # match data, corrupting the first row's reported bank match.
+        # Amount is optional (some lookups don't have a specific amount to
+        # disambiguate with) so this stays backward compatible.
+        key = f"{str(branch or '').strip().upper()}::{_norm_bill(bill)}"
+        if amount is not None:
+            try:
+                key += f"::{round(float(amount), 2)}"
+            except (TypeError, ValueError):
+                pass
+        return key
 
     def _pick_single_gateway(gateways):
         # A matched transaction should show ONE confirmed gateway, not a
@@ -4421,6 +4607,7 @@ def process_gateway_files(
         bank_dates = []
         bank_refs = []
         bank_party = []
+        bank_pg_party = []
         bank_gateways = []
         bank_branches = []
         bank_amount = 0.0
@@ -4431,6 +4618,8 @@ def process_gateway_files(
                 bank_refs.append(str(item.get("utr", "")))
             if item.get("party"):
                 bank_party.append(str(item.get("party", "")))
+            if item.get("pg_party"):
+                bank_pg_party.append(str(item.get("pg_party", "")))
             if item.get("gateway"):
                 bank_gateways.append(str(item.get("gateway", "")))
             if item.get("branch"):
@@ -4441,11 +4630,12 @@ def process_gateway_files(
             if not bill:
                 continue
             book_branch = str(book_item.get("branch", "")).strip()
-            key = _bill_key(book_branch, bill)
+            key = _bill_key(book_branch, bill, book_item.get("amount"))
             backdated_credit_by_bill[key] = dict(
                 date=" / ".join(dict.fromkeys(bank_dates)),
                 ref=" / ".join(dict.fromkeys(bank_refs)),
                 party=" / ".join(dict.fromkeys(bank_party)),
+                pg_party=" / ".join(dict.fromkeys(bank_pg_party)),
                 gateway=_pick_single_gateway(dict.fromkeys(bank_gateways)),
                 branch=" / ".join(dict.fromkeys(bank_branches)),
                 amount=bank_amount,
@@ -4459,7 +4649,7 @@ def process_gateway_files(
             continue
         for _, ps_row in ps_all.iterrows():
             if _norm_bill(ps_row["bill_no"]) == ref_norm:
-                key = _bill_key(ps_row["branch"], ps_row["bill_no"])
+                key = _bill_key(ps_row["branch"], ps_row["bill_no"], ps_row["amount"])
                 if key not in bill_to_bank_date:
                     bill_to_bank_date[key] = txn["date"]
                     bill_to_bank_ref[key]  = txn["ref"]
@@ -4485,6 +4675,8 @@ def process_gateway_files(
             _order_info = name_report_lookup.get(_order_key) or total_order_lookup.get(_order_key, {})
             _payu_match_pool.append(dict(
                 party=_payu_party_for_name_match(_txn_id, _pa, _pr.get("Customer Name", "")),
+                raw_party=str(_pr.get("Customer Name", "") or "").strip(),
+                pg_party=str(_gateway_extra_info(_txn_id, _pa)[3] or "").strip(),
                 amount=_pa,
                 date=_coerce_ts(_pr.get("AddedOn")),
                 merchant_utr=str(_pr.get("Merchant UTR", "") or "").strip(),
@@ -4511,6 +4703,8 @@ def process_gateway_files(
                 _order_info = name_report_lookup.get(_order_key) or total_order_lookup.get(_order_key, {})
                 _payu_match_pool.append(dict(
                     party=_gateway_party_for_name_match(_txn_id, _ca, _detail.get("customer_name", "") or _ref),
+                    raw_party=str(_detail.get("customer_name", "") or _ref or "").strip(),
+                    pg_party=str(_gateway_extra_info(_txn_id, _ca)[3] or "").strip(),
                     amount=_ca,
                     date=_coerce_ts(_detail.get("event_time") or _detail.get("settlement_date")),
                     bank_date=_coerce_ts(_detail.get("settlement_date")),
@@ -4527,6 +4721,8 @@ def process_gateway_files(
             _order_info = name_report_lookup.get(_order_key) or total_order_lookup.get(_order_key, {})
             _payu_match_pool.append(dict(
                 party=_gateway_party_for_name_match(_txn_id, _ca, _cr.get("id", "")),
+                raw_party=str(_cr.get("id", "") or "").strip(),
+                pg_party=str(_gateway_extra_info(_txn_id, _ca)[3] or "").strip(),
                 amount=_ca,
                 date=_coerce_ts(_cr.get("settlement_date")),
                 bank_date=_coerce_ts(_cr.get("settlement_date")),
@@ -4546,6 +4742,8 @@ def process_gateway_files(
             _order_info = name_report_lookup.get(_order_key) or total_order_lookup.get(_order_key, {})
             _payu_match_pool.append(dict(
                 party=_gateway_party_for_name_match(_txn_id, _ea, _ep),
+                raw_party=str(_ep or "").strip(),
+                pg_party=str(_gateway_extra_info(_txn_id, _ea)[3] or "").strip(),
                 amount=_ea,
                 date=_coerce_ts(_et.get("Date") or _et.get("Transaction Date") or _et.get("AddedOn")),
                 merchant_utr=str(_et.get("Easebuzz Trxn ID") or _et.get("Txn ID") or "").strip(),
@@ -4594,14 +4792,22 @@ def process_gateway_files(
         return raw_date.strftime("%d.%m.%Y") if raw_date is not None and not pd.isna(raw_date) else ""
 
     def _gateway_order_fields(gw):
+        # A matched transaction can be genuinely absent from both the Name
+        # Matching Report and Total Orders List (a real data gap, not a bug
+        # -- e.g. "DP709576" simply has no entry in either source). Even so,
+        # the transaction's own reference is already known from the match
+        # itself, so "Merchant / Order ID" shouldn't be left fully blank
+        # when we have that much to show -- only the extra order_info detail
+        # (branch, payment method, etc.) is genuinely unavailable.
         info = (gw or {}).get("order_info") or {}
+        fallback_txn_id = str((gw or {}).get("txn_id", "") or "").strip()
         if not info:
-            return {}
+            return dict(order_id=fallback_txn_id) if fallback_txn_id else {}
         payment_method = info.get("total_order_payment_method") or info.get("payment_method", "")
         order_payment_status = info.get("total_order_payment_status") or info.get("payment_status", "")
         name_payment_status = info.get("name_report_payment_status", "")
         return dict(
-            order_id=info.get("order_id", ""),
+            order_id=info.get("order_id", "") or fallback_txn_id,
             total_order_branch=info.get("total_order_branch") or info.get("branch", ""),
             total_order_payment_method=payment_method,
             total_order_payment_status=order_payment_status,
@@ -4617,7 +4823,7 @@ def process_gateway_files(
         ps_amount = float(ps_row["amount"] or 0.0)
         ps_date   = ps_row["date"]
         book_date_str = ps_date.strftime("%d.%m.%Y") if pd.notna(ps_date) else ""
-        bill_key  = _bill_key(ps_row["branch"], bill)
+        bill_key  = _bill_key(ps_row["branch"], bill, ps_amount)
 
         # ── Priority 1: Direct bill-number match in bank statement ────────────
         if bill_key in backdated_credit_by_bill:
@@ -4626,12 +4832,13 @@ def process_gateway_files(
             cheque_match_report.append(dict(
                 book_date=book_date_str,
                 book_bill=bill,
-                book_party=ps_party,
+                book_party="INDIVI - " + ps_party,
                 book_amount=ps_amount,
                 bank_date=backdated.get("date", ""),
                 bank_ref=backdated.get("ref", ""),
                 bank_amount=float(backdated.get("amount", 0.0) or 0.0),
                 bank_party=backdated.get("party", ""),
+                pg_party=backdated.get("pg_party", ""),
                 gateway=backdated.get("gateway", ""),
                 total_order_branch=backdated.get("branch", ""),
                 name_score=100,
@@ -4657,7 +4864,7 @@ def process_gateway_files(
                 cheque_match_report.append(dict(
                     book_date=book_date_str,
                     book_bill=bill,
-                    book_party=ps_party,
+                    book_party="INDIVI - " + ps_party,
                     book_amount=ps_amount,
                     bank_date=bank_txn["date"],
                     bank_ref=bank_txn["ref"],
@@ -4690,7 +4897,7 @@ def process_gateway_files(
                 cheque_match_report.append(dict(
                     book_date=book_date_str,
                     book_bill=bill,
-                    book_party=ps_party,
+                    book_party="INDIVI - " + ps_party,
                     book_amount=ps_amount,
                     bank_date="",
                     bank_ref=_gateway_txn_ref(best_gw),
@@ -4706,7 +4913,7 @@ def process_gateway_files(
                 cheque_match_report.append(dict(
                     book_date=book_date_str,
                     book_bill=bill,
-                    book_party=ps_party,
+                    book_party="INDIVI - " + ps_party,
                     book_amount=ps_amount,
                     bank_date="",
                     bank_ref="",
@@ -4753,11 +4960,13 @@ def process_gateway_files(
             cheque_match_report.append(dict(
                 book_date=book_date_str,
                 book_bill=bill,
-                book_party=ps_party,
+                book_party="INDIVI - " + ps_party,
                 book_amount=ps_amount,
                 bank_date=_gateway_match_bank_date(best_gw),
                 bank_ref=_gateway_txn_ref(best_gw),
                 bank_amount=best_gw["amount"],
+                bank_party=best_gw.get("raw_party") or best_gw["party"],
+                pg_party=best_gw.get("pg_party", ""),
                 name_score=best_nm_score,
                 name_label=best_nm_label,
                 amount_diff=amt_diff,
@@ -4775,11 +4984,13 @@ def process_gateway_files(
             cheque_match_report.append(dict(
                 book_date=book_date_str,
                 book_bill=bill,
-                book_party=ps_party,
+                book_party="INDIVI - " + ps_party,
                 book_amount=ps_amount,
                 bank_date=_gateway_match_bank_date(best_gw),
                 bank_ref=_gateway_txn_ref(best_gw),
                 bank_amount=best_gw["amount"],
+                bank_party=best_gw.get("raw_party") or best_gw["party"],
+                pg_party=best_gw.get("pg_party", ""),
                 name_score=best_nm_score,
                 name_label=best_nm_label,
                 amount_diff=amt_diff,
@@ -4794,7 +5005,7 @@ def process_gateway_files(
             cheque_match_report.append(dict(
                 book_date=book_date_str,
                 book_bill=bill,
-                book_party=ps_party,
+                book_party="INDIVI - " + ps_party,
                 book_amount=ps_amount,
                 bank_date="",
                 bank_ref="",
@@ -5183,7 +5394,7 @@ def process_gateway_files(
         b = rec.get("book_bill", "")
         if not b:
             continue
-        bk = _bill_key(rec.get("total_order_branch", ""), b)
+        bk = _bill_key(rec.get("total_order_branch", ""), b, rec.get("book_amount"))
         order_no = str(rec.get("order_id", "") or "").strip()
         if order_no:
             bill_to_order_no.setdefault(bk, order_no)
@@ -5230,8 +5441,8 @@ def process_gateway_files(
                 out.append(text)
         return " / ".join(out)
 
-    def _cheque_deposit_narration_date(bill, branch="", bank_ref="", gw_ref="", fallback_date=""):
-        bill_key = _bill_key(branch, bill)
+    def _cheque_deposit_narration_date(bill, branch="", amount=None, bank_ref="", gw_ref="", fallback_date=""):
+        bill_key = _bill_key(branch, bill, amount)
         if bill_key in backdated_credit_by_bill:
             return str(backdated_credit_by_bill.get(bill_key, {}).get("date", "") or "").strip()
         return (
@@ -5291,7 +5502,7 @@ def process_gateway_files(
     _existing_backdated_display_bills = {str(item.get("book_bill", "")).strip() for item in backdated_clear_display_rows}
     for _, _bd_row in ps_all.iterrows():
         _bd_bill = str(_bd_row.get("bill_no", "") or "").strip()
-        _bd_key = _bill_key(_bd_row.get("branch", ""), _bd_bill)
+        _bd_key = _bill_key(_bd_row.get("branch", ""), _bd_bill, _bd_row.get("amount"))
         if not _bd_bill or _bd_key not in backdated_credit_by_bill or _bd_bill in _existing_backdated_display_bills:
             continue
         _bd_info = backdated_credit_by_bill.get(_bd_key, {})
@@ -5305,7 +5516,7 @@ def process_gateway_files(
             book_branch=str(_bd_row.get("branch", "") or "").strip(),
             book_bill=_bd_bill,
             book_chq="511",
-            book_party=str(_bd_row.get("party", "") or "").strip(),
+            book_party="INDIVI - " + str(_bd_row.get("party", "") or "").strip(),
             book_amount=float(_bd_row.get("amount", 0.0) or 0.0),
             bank_date=str(_bd_info.get("date", "") or "").strip(),
             bank_ref=str(_bd_info.get("ref", "") or "").strip(),
@@ -5349,7 +5560,7 @@ def process_gateway_files(
         r += 1
         dt        = row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else ""
         bill      = row["bill_no"]
-        bill_key  = _bill_key(row["branch"], bill)
+        bill_key  = _bill_key(row["branch"], bill, row["amount"])
         party     = "INDIVI - " + str(row["party"])
         bank_dt   = bill_to_bank_date.get(bill_key)
         bank_utr  = bill_to_bank_ref.get(bill_key, "")
@@ -5361,7 +5572,7 @@ def process_gateway_files(
             gw_txn = str(gw_match.get("ref", "") or "").strip()
         gw_date   = _fmt_gateway_date(gw_match.get("date")) if gw_match else ""
         display_dt = bank_dt or gw_date
-        narration_dt = _cheque_deposit_narration_date(bill, row["branch"], bank_utr, gw_txn, display_dt)
+        narration_dt = _cheque_deposit_narration_date(bill, row["branch"], row["amount"], bank_utr, gw_txn, display_dt)
         narration = (f"BACKDATED CLEAR - PREVIOUS BRS | CREDITED AS ON\n{narration_dt}" if bill_key in backdated_credit_by_bill and narration_dt
                      else "BACKDATED CLEAR - PREVIOUS BRS" if bill_key in backdated_credit_by_bill
                      else f"CREDITED AS ON\n{narration_dt}" if narration_dt
@@ -5419,14 +5630,11 @@ def process_gateway_files(
         gateway = _clean_gateway_display(item.get("gateway", "")) or "PREV-BRS"
         party = "INDIVI - " + str(item.get("book_party", "")).replace("INDIVI - ", "").strip()
         narration_dt = str(item.get("bank_date", "") or "").strip()
-        narration = (
-            f"BACKDATED CLEAR - PREVIOUS BRS | CREDITED AS ON\n{narration_dt}"
-            + (f" | {item.get('flags', '')}" if item.get("flags") else "")
-        )
+        narration = f"BACKDATED CLEAR - PREVIOUS BRS | CREDITED AS ON\n{narration_dt}"
         vals = [item.get("book_date", ""), item.get("book_branch", ""), "GATEWAY",
                 item.get("book_bill", ""), item.get("book_chq", "511"), party,
                 item.get("book_amount", 0.0), gateway,
-                (bill_to_order_no.get(_bill_key(item.get("book_branch", ""), item.get("book_bill", "")), "")
+                (bill_to_order_no.get(_bill_key(item.get("book_branch", ""), item.get("book_bill", ""), item.get("book_amount")), "")
                  or item.get("bank_ref", "")),
                 narration]
         bd_fills = [C_GREY, C_GREY, C_GREY, C_GREY, C_GREY,
@@ -5446,8 +5654,8 @@ def process_gateway_files(
         r += 1
         dt        = row["date"].strftime("%d.%m.%Y") if pd.notna(row["date"]) else ""
         narr      = str(row[13])[:80] if pd.notna(row[13]) else ""
-        bank_utr_b = bill_to_bank_ref.get(_bill_key(row["branch"], row["bill_no"]), "")
-        gw_txn_b   = bill_to_gw_txn.get(_bill_key(row["branch"], row["bill_no"]), "")
+        bank_utr_b = bill_to_bank_ref.get(_bill_key(row["branch"], row["bill_no"], row["amount"]), "")
+        gw_txn_b   = bill_to_gw_txn.get(_bill_key(row["branch"], row["bill_no"], row["amount"]), "")
         base_ref_b = bank_utr_b if bank_utr_b else row["bill_no"]
         if gw_txn_b and gw_txn_b != base_ref_b:
             utr_display_b = f"{base_ref_b}  |  {gw_txn_b}"
@@ -5560,11 +5768,11 @@ def process_gateway_files(
     
     # ─── Sheet 7: PayU Transactions ──────────────────────────────────────────────
     ws6 = wb.create_sheet("PayU Transactions")
-    col_w(ws6, [22,24,14,14,14,14,14,18,4,4,4,4,18,16,18,26,18]); ws6.freeze_panes = "A3"
+    col_w(ws6, [22,24,14,14,14,14,14,18,16,4,4,4,4,18,16,18,26,18]); ws6.freeze_panes = "A3"
     r = 1
-    write_title(ws6, r, f"PayU Regular Transactions -- SUCCESS  |  {BRS_DATE}", 8); r += 1
+    write_title(ws6, r, f"PayU Regular Transactions -- SUCCESS  |  {BRS_DATE}", 9); r += 1
     write_hdr(ws6, r, ["AddedOn","Merchant Txn ID","Amount (Rs)","Amount(Net)",
-                       "Proc Fees","Svc Tax","Payment Type","Customer Name"])
+                       "Proc Fees","Svc Tax","Payment Type","Customer Name","Requested Action"])
     _write_gateway_extra_headers(ws6, r)
     for _, row in payu_suc.iterrows():
         r += 1
@@ -5572,7 +5780,8 @@ def process_gateway_files(
                                 row["Amount"], row["Amount(Net)"],
                                 row["Total Processing fees"], row["Total Service Tax"],
                                 str(row.get("Payment Type","")),
-                                str(row.get("Customer Name",""))[:40]], 1):
+                                str(row.get("Customer Name",""))[:40],
+                                str(row.get("Requested Action","") or "")], 1):
             sc(ws6, r, c, v, h_align="right" if c in [3,4,5,6] else "left",
                num_fmt=NF if c in [3,4,5,6] else None)
         _write_gateway_extra_values(
@@ -5694,7 +5903,7 @@ def process_gateway_files(
     r = 1
     write_title(ws7, r, f"EaseBuzz Settlement Detail  |  {BRS_DATE}", 9); r += 1
     write_hdr(ws7, r, ["#","Easebuzz Txn ID","Merchant Txn ID","Transaction Date",
-                       "Txn Amount (Rs)","Debited Amt (Rs)","Svc Charge","GST","Payment Mode"])
+                       "Txn Amount (Rs)","Debited Amt (Rs)","Svc Charge","GST","Payment Mode","Customer Name"])
     _write_gateway_extra_headers(ws7, r)
     if eb_info:
         r += 1
@@ -5710,7 +5919,7 @@ def process_gateway_files(
         r += 1
         write_title(ws7, r, "Settled Transactions", 9, bg=C_BLUE); r += 1
         write_hdr(ws7, r, ["#","Easebuzz Txn ID","Merchant Txn ID","Transaction Date",
-                           "Txn Amount","Debited Amt","Svc Charge","GST","Payment Mode"], bg=C_BLUE)
+                           "Txn Amount","Debited Amt","Svc Charge","GST","Payment Mode","Customer Name"], bg=C_BLUE)
         _write_gateway_extra_headers(ws7, r)
         for txn in eb_info.get("txns", []):
             r += 1
@@ -5720,7 +5929,8 @@ def process_gateway_files(
                                     safe_float(txn.get("Debited Amount",0)),
                                     safe_float(txn.get("Service Charge",0)),
                                     safe_float(txn.get("GST", txn.get("TDR",0))),
-                                    txn.get("Payment Mode","")], 1):
+                                    txn.get("Payment Mode",""),
+                                    txn.get("Customer Name","")], 1):
                 sc(ws7, r, c, v, h_align="right" if c in [5,6,7,8] else "left",
                    num_fmt=NF if c in [5,6,7,8] else None)
             eb_txn_id = txn.get("Merchant Trxn ID") or txn.get("Merchant Txn ID") or ""
@@ -5729,6 +5939,29 @@ def process_gateway_files(
                 _gateway_extra_info(eb_txn_id, safe_float(txn.get("Transaction Amount", 0)))
                 + (_fmt_bank_settlement_date(eb_info.get("neft_ref", "")),)
             )
+
+        # Refunds live in a completely separate section of the raw EaseBuzz
+        # report (distinct from "Settled Transactions") and were previously
+        # never parsed at all, so a refunded transaction was invisible here
+        # even though it's real money that left the account.
+        eb_refunds = eb_info.get("refunds", [])
+        if eb_refunds:
+            r += 2
+            write_title(ws7, r, "Refund Transactions", 10, bg=C_ORNG); r += 1
+            write_hdr(ws7, r, ["#", "Refund ID", "Easebuzz Trxn ID", "Merchant Trxn ID",
+                               "Transaction Amount", "Refund Amount", "Payment Mode",
+                               "Customer Name", "Customer Email", "Customer Phone"], bg=C_ORNG)
+            for rf in eb_refunds:
+                r += 1
+                for c, v in enumerate([
+                        rf.get("#", ""), rf.get("Refund ID", ""), rf.get("Easebuzz Trxn ID", ""),
+                        rf.get("Merchant Trxn ID", ""),
+                        safe_float(rf.get("Transaction Amount", 0)),
+                        safe_float(rf.get("Refund Amount", 0)),
+                        rf.get("Payment Mode", ""), rf.get("Customer Name", ""),
+                        rf.get("Customer Email", ""), rf.get("Customer Phone", "")], 1):
+                    sc(ws7, r, c, v, bg=C_AMBER, h_align="right" if c in [5, 6] else "left",
+                       num_fmt=NF if c in [5, 6] else None)
     else:
         r += 1; sc(ws7, r, 1, "No EaseBuzz file provided.", bg=C_AMBER)
 
@@ -5809,26 +6042,14 @@ def process_gateway_files(
         return f"Diff Rs{diff:+,.2f}"
 
     def _matched_pg_party(rec):
-        # Prefer a party name carried directly on the record (e.g. from the
-        # underlying bank/gateway item itself) over inferring one indirectly
-        # -- direct data beats regex-guessing free text, and avoids falling
-        # through to the raw order/reference ID when no quoted name happens
-        # to appear in the verdict reason text.
-        direct_party = str(rec.get("bank_party", "") or "").strip()
-        if direct_party:
-            return direct_party
-        amount = float(rec.get("bank_amount", 0.0) or rec.get("book_amount", 0.0) or 0.0)
-        if amount > 50000:
-            for ref in (rec.get("order_id", ""), rec.get("bank_ref", ""), rec.get("book_bill", "")):
-                name_info = name_report_lookup.get(_clean_order_id(ref), {})
-                report_party = str(name_info.get("party", "") or "").strip()
-                if report_party:
-                    return report_party
-        reason = str(rec.get("verdict_reason", "") or "")
-        m = re.search(r"'([^']+)'", reason)
-        if m:
-            return m.group(1)
-        return str(rec.get("bank_ref", "") or "")
+        pg_party = str(rec.get("pg_party", "") or "").strip()
+        if pg_party:
+            return pg_party
+        for ref in (rec.get("order_id", ""), rec.get("bank_ref", ""), rec.get("book_bill", "")):
+            bank_name = str(name_report_lookup.get(_clean_order_id(ref), {}).get("bank_name", "") or "").strip()
+            if bank_name:
+                return bank_name
+        return ""
 
     def _matched_name_at_bank(rec):
         for ref in (rec.get("order_id", ""), rec.get("bank_ref", ""), rec.get("book_bill", "")):
@@ -5846,7 +6067,7 @@ def process_gateway_files(
         if direct_gateway:
             return _clean_gateway_display(direct_gateway).upper()
         bill = str(rec.get("book_bill", "") or "").strip()
-        gateway = str(bill_to_gw_name.get(_bill_key(rec.get("total_order_branch", ""), bill), "") or "").strip()
+        gateway = str(bill_to_gw_name.get(_bill_key(rec.get("total_order_branch", ""), bill, rec.get("book_amount")), "") or "").strip()
         if gateway:
             return _clean_gateway_display(gateway).upper()
         reason = str(rec.get("verdict_reason", "") or "")
@@ -5880,7 +6101,15 @@ def process_gateway_files(
         rows = []
         for match in backdated_credit_matches:
             label = str(match.get("label", "") or "")
-            if "previous" not in label.lower():
+            # "current DNC vs previous CNB" matches are already shown in the
+            # main section above with a "MATCHED" verdict (via the
+            # backdated_credit_by_bill lookup) -- this section is meant for
+            # the OTHER direction ("previous DNC vs current CNB", a
+            # carried-forward book bill matching today's fresh credit) which
+            # isn't shown anywhere else. Both labels contain the substring
+            # "previous", so a simple substring check pulled in both,
+            # duplicating every "current DNC vs previous CNB" match here too.
+            if "previous" not in label.lower() or label == "current DNC vs previous CNB":
                 continue
             book_items = match.get("book_items", []) or []
             bank_items = match.get("bank_items", []) or []
@@ -5908,6 +6137,7 @@ def process_gateway_files(
                 bank_date=_join_unique(item.get("date", "") for item in bank_items),
                 bank_ref=_join_unique(item.get("utr", "") for item in bank_items),
                 bank_party=_join_unique(item.get("party", "") for item in bank_items),
+                pg_party=_join_unique(item.get("pg_party", "") for item in bank_items),
                 bank_amount=bank_amt,
                 bank_branch=_join_unique(item.get("branch", "") for item in bank_items),
                 bank_gateway=_join_unique(item.get("gateway", "") for item in bank_items),
@@ -5941,7 +6171,7 @@ def process_gateway_files(
         af = C_GREEN if amt_flag == "Exact" else (C_ORNG if amt_flag == "DNC" else C_RED)
         df = C_GREEN if abs(diff) < 1 and bank_amt else (C_AMBER if rec.get("verdict") == "DNC" else C_RED)
         ff = C_RED if rec.get("verdict") == "UNMATCHED" else (C_AMBER if rec.get("verdict") == "REVIEW" else C_GREY)
-        book_party = _matched_book_party(rec.get("book_party", ""))
+        book_party = str(rec.get("book_party", "") or "").strip()
         book_branch = _ps_branch_by_bill.get(str(rec.get("book_bill", "")).strip(), "")
         payment_status = str(rec.get("payment_status", "") or "").strip()
         partial_payment = payment_status if "2%" in payment_status or "2 %" in payment_status else ""
@@ -5992,10 +6222,10 @@ def process_gateway_files(
             vals = [
                 item["method"], name_flag, item["score"],
                 item["book_date"], item.get("book_branch", ""), "GATEWAY", item["book_bill"], "",
-                _matched_book_party(item["book_party"]), book_amt, "INFLOW",
+                str(item["book_party"] or "").strip(), book_amt, "INFLOW",
                 item["bank_date"], _matched_total_order_branch(item.get("bank_branch", "")),
                 item.get("bank_ref", ""), _matched_gateway_name(item.get("bank_gateway", "")),
-                item["bank_party"], item["bank_party"],
+                item["bank_party"], item.get("pg_party", ""),
                 "", bank_amt, "", "INFLOW",
                 diff, "", item["flags"],
             ]

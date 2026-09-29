@@ -6,6 +6,8 @@ from typing import Any, Dict, List
 import os, tempfile, gc, shutil
 import zipfile
 import threading
+import json
+import hashlib
 from datetime import datetime
 import math
 import numpy as np
@@ -38,10 +40,54 @@ ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls", ".pdf"}
 
 _archive_lock = threading.Lock()
 
+CHECKSUM_INDEX_FILENAME = "_checksums.json"
+MANIFEST_FILENAME = "manifest.json"
+
 def _ext(filename: str) -> str:
     return os.path.splitext(filename)[1].lower()
 
-def _next_transaction_dir(recon_type: str) -> str:
+def _load_checksum_index(base):
+    """checksum -> transactionN, for every book/all_branches file already
+    archived under this date+recon_type. Best-effort: a missing/corrupt
+    index is treated as empty rather than failing the archive."""
+    path = os.path.join(base, CHECKSUM_INDEX_FILENAME)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+def _save_checksum_index(base, index):
+    try:
+        with open(os.path.join(base, CHECKSUM_INDEX_FILENAME), "w") as fh:
+            json.dump(index, fh)
+    except OSError as e:
+        print(f"[archive] Failed to save checksum index at {base}: {e}")
+
+def _write_manifest(txn_dir, checksum, duplicate_of):
+    try:
+        with open(os.path.join(txn_dir, MANIFEST_FILENAME), "w") as fh:
+            json.dump({"checksum": checksum, "duplicate_of": duplicate_of}, fh)
+    except OSError as e:
+        print(f"[archive] Failed to write manifest at {txn_dir}: {e}")
+
+def _next_transaction_dir(recon_type: str, checksum: str = None):
+    """Create the next transactionN folder for today's date+recon_type.
+
+    If `checksum` is given, also checks it - atomically, under the same
+    lock used to allocate the folder - against every checksum already
+    recorded for that date+recon_type today, and records it if new. This
+    is how an exact re-upload (the user uploaded the wrong file, then
+    uploaded it again) gets flagged the moment it's archived, rather than
+    only surfacing later when the dashboard is next rebuilt.
+
+    Returns (txn_dir, duplicate_of). duplicate_of is the transactionN whose
+    checksum this one matches - always the FIRST upload with that checksum,
+    even if there have been several duplicates since - or None if this
+    checksum is new (or none was given).
+    """
     date_folder = datetime.now().strftime("%d-%m-%Y")
     base = os.path.join(TRANSACTIONS_DIR, date_folder, recon_type)
     with _archive_lock:
@@ -51,30 +97,57 @@ def _next_transaction_dir(recon_type: str) -> str:
             for d in os.listdir(base)
             if d.startswith("transaction") and d.replace("transaction", "").isdigit()
         ]
-        txn_dir = os.path.join(base, f"transaction{max(existing, default=0) + 1}")
+        txn_name = f"transaction{max(existing, default=0) + 1}"
+        txn_dir = os.path.join(base, txn_name)
         os.makedirs(txn_dir)
-    return txn_dir
+
+        duplicate_of = None
+        if checksum:
+            index = _load_checksum_index(base)
+            duplicate_of = index.get(checksum)
+            if duplicate_of is None:
+                index[checksum] = txn_name
+                _save_checksum_index(base, index)
+    return txn_dir, duplicate_of
 
 def _archive_transaction(recon_type, input_files, output_path, output_name):
     """Copy inputs + output into the Transactions archive.
 
-    Returns the transaction_ref string (e.g. "03-08-2026/bank/transaction7")
-    identifying where this run was saved, or None if archiving failed. The
-    ref is a relative path under TRANSACTIONS_DIR — it's what a later
-    /workflow/regenerate call uses to find the original input files again.
+    Returns (transaction_ref, duplicate_of):
+      transaction_ref - relative path (e.g. "03-08-2026/bank/transaction7")
+        identifying where this run was saved, or None if archiving failed.
+        It's what a later /workflow/regenerate call uses to find the
+        original input files again.
+      duplicate_of - the transactionN this run's book/all_branches file is a
+        byte-for-byte re-upload of, if an exact match was found among this
+        date+channel's already-archived uploads; None otherwise. The folder
+        is still archived in full either way (nothing is silently dropped -
+        this is metadata for the dashboard/UI to act on, not a rejection).
     """
     try:
-        txn_dir = _next_transaction_dir(recon_type)
+        book_prefix = pipeline.book_prefix_for(recon_type)
+        book_src = next(
+            (src for src, name in input_files if src and name.lower().startswith(book_prefix)),
+            None,
+        )
+        checksum = pipeline.file_checksum(book_src) if book_src else None
+
+        txn_dir, duplicate_of = _next_transaction_dir(recon_type, checksum)
+        if duplicate_of:
+            print(f"[archive] {recon_type}/{os.path.basename(txn_dir)}: "
+                  f"checksum matches {duplicate_of} - flagging as a duplicate upload.")
+        _write_manifest(txn_dir, checksum, duplicate_of)
+
         for src_path, save_name in input_files:
             if src_path and os.path.exists(src_path):
                 shutil.copy2(src_path, os.path.join(txn_dir, save_name))
         if output_path and os.path.exists(output_path):
             shutil.copy2(output_path, os.path.join(txn_dir, output_name))
         _invalidate_dashboard_cache_async()
-        return os.path.relpath(txn_dir, TRANSACTIONS_DIR).replace(os.sep, "/")
+        return os.path.relpath(txn_dir, TRANSACTIONS_DIR).replace(os.sep, "/"), duplicate_of
     except Exception as e:
         print(f"[archive] Failed to archive {recon_type} transaction: {e}")
-        return None
+        return None, None
 
 def _sanitize(obj):
     """Recursively sanitize for JSON — handles numpy/pandas scalar types."""
@@ -333,7 +406,7 @@ async def reconcile_endpoint(
             "transactions": _sanitize(book_transactions),
         }
 
-        post_reconciliation(transaction_info)
+        #post_reconciliation(transaction_info)
 
         brs_date = extract_brs_date(prev_brs_path)
 
@@ -363,7 +436,7 @@ async def reconcile_endpoint(
         with open(output_path, "rb") as f:
             file_data = f.read()
         
-        transaction_ref = _archive_transaction("bank", [
+        transaction_ref, duplicate_of = _archive_transaction("bank", [
             (book_path,     f"book_report{_ext(book_file.filename)}"),
             (stmt_path,     f"bank_statement{_ext(statement_file.filename)}"),
             (prev_brs_path, f"previous_brs{_ext(previous_brs_file.filename)}"),
@@ -425,6 +498,7 @@ async def reconcile_endpoint(
         "file_bytes": file_data.hex(),
         "file_name":  "Reconciliation.xlsx",
         "transaction_ref": transaction_ref,
+        "duplicate_of": duplicate_of,
     }))
 
 
@@ -640,7 +714,7 @@ async def reconcile_qr_endpoint(
             "transactions": _sanitize(qr_transactions),
         }
 
-        post_reconciliation(transaction_info)
+        # post_reconciliation(transaction_info)
  
         output_path = os.path.join(tmpdir, "QR_Reconciliation.xlsx")
  
@@ -658,7 +732,7 @@ async def reconcile_qr_endpoint(
         with open(output_path, "rb") as f:
             file_data = f.read()
         
-        transaction_ref = _archive_transaction("qr", [
+        transaction_ref, duplicate_of = _archive_transaction("qr", [
             (all_branches_path, f"all_branches{_ext(all_branches_file.filename)}"),
             (hot_book_path,     f"hot_book{_ext(hot_book_file.filename)}"),
             (stmt_path,         f"qr_statement{_ext(statement_file.filename)}"),
@@ -845,6 +919,7 @@ async def reconcile_qr_endpoint(
         "file_bytes": file_data.hex(),
         "file_name":  "QR_Reconciliation.xlsx",
         "transaction_ref": transaction_ref,
+        "duplicate_of": duplicate_of,
     }))
 
 
@@ -1139,7 +1214,7 @@ async def reconcile_gateway_endpoint(
             "transactions": _sanitize(gateway_transactions),
         }
 
-        post_reconciliation(transaction_info)
+        # post_reconciliation(transaction_info)
 
         output_path = os.path.join(tmpdir, "Gateway_BRS.xlsx")
         # Run full Gateway reconciliation
@@ -1207,7 +1282,7 @@ async def reconcile_gateway_endpoint(
         _gw_inputs.append((name_match_path,        f"name_match{_ext(name_match_file.filename)}"))
         _gw_inputs.append((total_orders_path,      f"total_orders{_ext(total_orders_file.filename)}"))
 
-        transaction_ref = _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
+        transaction_ref, duplicate_of = _archive_transaction("gateway", _gw_inputs, output_path, "Gateway_BRS.xlsx")
         
 
 
@@ -1470,6 +1545,7 @@ async def reconcile_gateway_endpoint(
         "file_bytes": file_data.hex(),
         "file_name":  "Gateway_BRS.xlsx",
         "transaction_ref": transaction_ref,
+        "duplicate_of": duplicate_of,
     }))
 
 

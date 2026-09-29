@@ -1,6 +1,8 @@
 import os
 import re
 import datetime
+import hashlib
+import json
 import tempfile
 import zipfile
 from collections import defaultdict
@@ -75,6 +77,61 @@ def _rows_via_openpyxl(path):
         out.append(vals)
     wb.close()
     return out
+
+
+def _file_checksum(path, chunk_size=65536):
+    """SHA-256 of a source file's raw bytes.
+
+    This tells you whether a folder is a *literal* re-upload (identical
+    file, byte for byte) vs. a re-generated export that happens to carry
+    the same transaction data (e.g. a fresh export from the bank's portal
+    with a different timestamp in the file metadata but unchanged rows) -
+    the latter still needs to be caught by the content fingerprint below,
+    since its checksum will differ even though it's still a duplicate
+    submission. Returns None if the file is missing/unreadable.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as fh:
+            for chunk in iter(lambda: fh.read(chunk_size), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+# public alias - app.py hashes the incoming file at archive time (before it's
+# even parsed) to catch exact re-uploads immediately, instead of waiting for
+# a dashboard rebuild to notice; it reuses this same implementation so a
+# write-time checksum and a read-time one are always computed identically.
+file_checksum = _file_checksum
+
+
+def book_prefix_for(recon_type):
+    """Filename prefix (matching collect_all's convention below) used to
+    identify which archived input file is the 'book' report a checksum/
+    fingerprint should be computed from, for a given channel."""
+    return 'book_report' if recon_type == 'bank' else 'all_branches'
+
+
+MANIFEST_FILENAME = 'manifest.json'
+
+
+def _read_manifest(tx_path):
+    """Read the manifest.json app.py writes into a transaction folder at
+    archive time, if present. Never raises - a missing/corrupt manifest
+    just means the folder falls back to being fully recomputed, same as
+    any transaction archived before this existed."""
+    path = os.path.join(tx_path, MANIFEST_FILENAME)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
 
 
 def _read_raw_rows(path):
@@ -201,6 +258,8 @@ def collect_all(transactions_root):
           date: 'DD-MM-YYYY' (source folder date string, as on disk),
           kind: 'bank' | 'qr',
           tx: 'transaction3',
+          checksum: sha256 hex digest of the source book/all_branches file, or None,
+          duplicate_of: transactionN this matched by checksum at upload time, or None,
           branch: str | None,
           rows: [ {type,date,chq_no,party,receipts,payments}, ... ],
           hv_rows: [ {section_code, section_label, bill_no, amount}, ... ],
@@ -223,19 +282,36 @@ def collect_all(transactions_root):
                 # bank has its own book_report; QR and gateway both use an
                 # "all_branches" file with identical layout (many branch
                 # sections back to back within one file)
-                book_prefix = 'book_report' if kind == 'bank' else 'all_branches'
+                book_prefix = book_prefix_for(kind)
                 candidates = [f for f in os.listdir(tx_path) if f.lower().startswith(book_prefix)]
-                rows, branch = ([], None)
+
+                # app.py writes a manifest.json at archive time with the
+                # checksum it already computed (and whether it matched an
+                # already-archived checksum for that date+kind then and
+                # there) - reuse it instead of re-hashing the file on every
+                # dashboard rebuild. Folders archived before this existed
+                # simply won't have one, and fall back to computing it here.
+                manifest = _read_manifest(tx_path)
+
+                rows, branch, checksum = ([], None, None)
                 if candidates:
-                    rows, branch = parse_book_report_with_branch(os.path.join(tx_path, candidates[0]))
+                    book_path = os.path.join(tx_path, candidates[0])
+                    rows, branch = parse_book_report_with_branch(book_path)
                     rows = rows or []
+                    checksum = (manifest or {}).get('checksum') or _file_checksum(book_path)
 
                 hv_fname = HV_FILENAMES[kind]
                 hv_rows = parse_human_verification(os.path.join(tx_path, hv_fname), kind) or []
 
                 folders.append({
-                    'date': date_folder, 'kind': kind, 'tx': tx,
+                    'date': date_folder, 'kind': kind, 'tx': tx, 'checksum': checksum,
                     'branch': branch, 'rows': rows, 'hv_rows': hv_rows,
+                    # write-time duplicate signal from app.py (checksum match
+                    # against another folder archived earlier that day+kind),
+                    # None if there's no manifest or it wasn't flagged then.
+                    # Purely informational - see _dedup_folders for what
+                    # actually decides duplicate exclusion from the totals.
+                    'duplicate_of': (manifest or {}).get('duplicate_of'),
                 })
     return folders
 
@@ -247,6 +323,50 @@ def collect_all(transactions_root):
 def _dedup_count(items):
     """Count of distinct non-empty keys, treating '' / None as always-unique-noise-free (i.e. dropped)."""
     return len({k for k in items if k})
+
+
+def _folder_content_key(f):
+    """Canonical fingerprint of a folder's parsed transaction rows.
+
+    Two folders with the same fingerprint hold the exact same transaction
+    data - i.e. the same book report / all_branches file was archived more
+    than once (typically the user uploaded the wrong file, noticed, and
+    uploaded the correct one again; or simply re-submitted after a failed
+    run). Order-independent (sorted) so row order in the source file doesn't
+    matter. Returns None for folders with no parsed rows - an empty
+    fingerprint can't tell two different blank/unreadable uploads apart, so
+    those are never treated as duplicates of one another.
+    """
+    if not f['rows']:
+        return None
+    return tuple(sorted(
+        (r['type'], str(r['date']), r['chq_no'], str(r['party']), r['receipts'], r['payments'], r['branch'])
+        for r in f['rows']
+    ))
+
+
+def _dedup_folders(flist):
+    """Collapse folders in a date+kind group that are exact re-uploads of
+    each other down to a single copy, so a resubmitted (duplicate) upload
+    isn't counted twice (or more) in the dashboard totals.
+
+    `flist` is expected in chronological upload order (collect_all walks
+    transaction folders in ascending transactionN order), so when duplicates
+    are found the most recently uploaded copy - presumably the one the user
+    meant to keep - is the one retained.
+    """
+    latest_by_key = {}
+    key_order = []
+    unkeyed = []
+    for f in flist:
+        key = _folder_content_key(f)
+        if key is None:
+            unkeyed.append(f)
+            continue
+        if key not in latest_by_key:
+            key_order.append(key)
+        latest_by_key[key] = f  # last write wins -> keeps the latest duplicate
+    return [latest_by_key[k] for k in key_order] + unkeyed
 
 
 def build_dashboard_data(transactions_root, generated_from_label):
@@ -264,6 +384,13 @@ def build_dashboard_data(transactions_root, generated_from_label):
             if not flist:
                 continue
 
+            # folders that are exact re-uploads of an earlier folder in this
+            # date+kind (e.g. the user uploaded the wrong file, then
+            # uploaded it again) - keep the aggregate totals below from
+            # counting the same submission more than once.
+            flist_dedup = _dedup_folders(flist)
+            kept_ids = {id(f) for f in flist_dedup}
+
             # ---- folder-level (local dedup within each folder) ----
             folder_details = []
             for f in flist:
@@ -275,10 +402,22 @@ def build_dashboard_data(transactions_root, generated_from_label):
                     'total_rows': len(f['rows']),
                     'hv_counted': len({r['bill_no'] for r in f['hv_rows'] if r['bill_no']}),
                     'branches': folder_branches or ([f['branch']] if f['branch'] else []),
+                    # sha256 of the source file - lets you visually confirm
+                    # whether two folders are byte-identical re-uploads.
+                    'checksum': f.get('checksum'),
+                    # True when this folder's data is an exact re-upload of
+                    # another folder the same day+channel, and is therefore
+                    # excluded from this channel's aggregate totals below.
+                    'is_duplicate': id(f) not in kept_ids,
+                    # which earlier transaction app.py matched this folder's
+                    # checksum against AT UPLOAD TIME, if any (None if there
+                    # was no manifest, or it wasn't a checksum match then).
+                    # Purely informational - doesn't drive is_duplicate above.
+                    'duplicate_of': f.get('duplicate_of'),
                 })
 
             # ---- day+channel level (dedup across ALL folders of that day+kind) ----
-            all_rows = [r for f in flist for r in f['rows']]
+            all_rows = [r for f in flist_dedup for r in f['rows']]
             all_chqs = [r['chq_no'] for r in all_rows]
             unique_txn = _dedup_count(all_chqs)
             total_rows = len(all_rows)
@@ -306,7 +445,7 @@ def build_dashboard_data(transactions_root, generated_from_label):
                     seen_chq.add(key)
                 amount += (r['receipts'] or 0) + (r['payments'] or 0)
 
-            all_hv = [r for f in flist for r in f['hv_rows']]
+            all_hv = [r for f in flist_dedup for r in f['hv_rows']]
             seen_bill = set()
             section_totals = defaultdict(int)
             hv_counted = 0
@@ -326,7 +465,7 @@ def build_dashboard_data(transactions_root, generated_from_label):
             branches = sorted({b for f in folder_details for b in f['branches']})
 
             channels[kind] = {
-                'txn_folders': len(flist),
+                'txn_folders': len(flist_dedup),
                 'total_rows': total_rows,
                 'unique_txn': unique_txn,
                 'unique_parties': len(parties),
