@@ -495,7 +495,6 @@ def process_gateway_files(
             values = list(value)
         return [Path(f) for f in values if f]
 
-    
     ALL_BRANCHES_FILE = Path(all_branches_path)
     HOT_BOOK_FILE     = Path(hot_book_path)
     STATEMENT_FILE    = Path(statement_path)
@@ -1370,11 +1369,27 @@ def process_gateway_files(
     
                 if _is_sentinel(col_f):
                     break
-                a_empty = (col_a is None or str(col_a).strip().lower() in ("", "none", "nan"))
+                # A cell holding only a stray keystroke (e.g. "`" typed into
+                # the date column of the manual DNC total row, amount
+                # 94,29,032) is still blank -- otherwise that section total
+                # gets carried forward as if it were a pending cheque.
+                a_empty = (
+                    col_a is None
+                    or str(col_a).strip().lower() in ("", "none", "nan")
+                    or not re.search(r"[A-Za-z0-9]", str(col_a))
+                )
                 b_empty = (col_b is None or str(col_b).strip().lower() in ("", "none", "nan"))
                 f_num   = _safe_numeric(col_amount)
                 if a_empty and b_empty and f_num is not None and f_num > 0:
-                    break
+                    # Usually the section total -- it carries the running
+                    # balance in column H and/or equals the items above it.
+                    # An amount with neither is a real entry typed without
+                    # date/branch (e.g. the 27.09 on-demand credit of
+                    # 28,27,000 in CNB) and must be carried forward.
+                    _run_bal = _safe_numeric(row[7]) if len(row) > 7 else None
+                    _so_far = sum(float(it["amount"]) for it in items)
+                    if not items or _run_bal is not None or abs(f_num - _so_far) <= 1:
+                        break
     
                 c0 = str(col_a).strip().lower() if col_a else ""
                 is_other_hdr = any(
@@ -2912,7 +2927,20 @@ def process_gateway_files(
             fees_t  = float(row.get("FeesTotal",fees + tax))
             extra   = {k: v for k, v in row.items()
                        if k not in ("UTR","Gross","Net","Fees","Tax","FeesTotal")}
-    
+
+            if utr not in bank_pool and len(_normalise_ref_token(utr)) >= 10:
+                # The bank sometimes keys a settlement with a prefix, e.g.
+                # PayU's IMPS payout "627115683199" sits in the bank pool as
+                # "IMPSI627115683199". Accept it only when exactly one bank
+                # credit carries the reference and the amount agrees.
+                _utr_tok = _normalise_ref_token(utr)
+                _hits = [
+                    k for k, v in bank_pool.items()
+                    if _utr_tok in _normalise_ref_token(k) and abs(float(v or 0.0) - net) < 1
+                ]
+                if len(_hits) == 1:
+                    bank_pool[utr] = bank_pool.pop(_hits[0])
+
             if utr in bank_pool:
                 bank_amt = bank_pool.pop(utr)
                 diff     = net - bank_amt
@@ -3447,6 +3475,23 @@ def process_gateway_files(
                     score = max(score, 85)
         return score
 
+    def _single_token_name_only(a, b):
+        """True if the only name evidence linking a and b is one shared word
+        (e.g. gateway name "Aditya" vs book "ADITYA DHOOKIA") with no shared
+        reference. _name_match_score scores that as a substring hit (85),
+        which is too weak to pair two items whose amounts also differ --
+        a repeat customer's cancelled earlier order would otherwise silently
+        cancel out a new, unrelated cash bill."""
+        a_ref = _normalise_ref_token(a.get("utr", ""))
+        b_ref = _normalise_ref_token(b.get("utr", ""))
+        if a_ref and b_ref and (a_ref in b_ref or b_ref in a_ref):
+            return False
+        tokens_a = {t for t in _normalise_name(a.get("party", "")).split() if len(t) > 1}
+        tokens_b = {t for t in _normalise_name(b.get("party", "")).split() if len(t) > 1}
+        if not tokens_a or not tokens_b or tokens_a == tokens_b:
+            return False
+        return min(len(tokens_a), len(tokens_b)) == 1 and len(tokens_a & tokens_b) <= 1
+
     def _clear_split_pairs(book_items, bank_items, label, same_day=False, amount_tol=500.0, name_thresh=70, matches=None):
         """Clear one-to-many and many-to-one DNC/CNB-style split matches."""
         cleared_book = set()
@@ -3471,6 +3516,10 @@ def process_gateway_files(
                 for ci, bank_item in candidates
                 if abs(float(bank_item.get("amount", 0.0) or 0.0) - target) <= amount_tol
                 and _split_match_score(book_item, bank_item) >= name_thresh
+                and (
+                    abs(float(bank_item.get("amount", 0.0) or 0.0) - target) <= 1.0
+                    or not _single_token_name_only(book_item, bank_item)
+                )
             ]
             if exact:
                 ci, bank_item = max(exact, key=lambda pair: _split_match_score(book_item, pair[1]))
@@ -3660,6 +3709,10 @@ def process_gateway_files(
         except Exception as e:
             print(f"[WARN] OND charge read failed for {od_file}: {e}")
 
+    # On-demand credits carried forward in CNB whose reversal completes today
+    # (dropped from CNB below; only the net charge goes to Less2).
+    _ond_completed_credit_keys = set()
+    _ond_completed_credit_items = set()  # id() of unlabelled carried credits
     if not payu_suc.empty:
         old_ond_credit = {
             _norm(i.get("utr", "")): float(i.get("amount", 0.0) or 0.0)
@@ -3674,12 +3727,59 @@ def process_gateway_files(
             m = re.fullmatch(r"OND_(\d+)", utr, flags=re.IGNORECASE)
             if not m:
                 continue
-            prev_amt = old_ond_credit.get(_norm(f"OND_{int(m.group(1)) - 1}"))
+            ond_no = int(m.group(1))
+            credit_key = _norm(f"OND_{ond_no - 1}")
+            prev_amt = old_ond_credit.get(credit_key)
+            partial_debit = None
             if not prev_amt:
-                continue
-            charge = round(abs(float(row.get("Amount(Net)", 0.0) or 0.0)) - prev_amt, 2)
+                # PayU can take an on-demand payout back in two debits on
+                # different days: credit OND_n (CNB), partial debit OND_n+1
+                # (already carried in Less2), final debit OND_n+2 today. E.g.
+                # OND_5942769 +47,00,000 -> OND_5942770 -34,63,619 ->
+                # OND_5942771 -12,39,154. Settle the whole chain: the credit
+                # and the partial debit leave the BRS and only the net
+                # charge remains in Less2.
+                credit_key = _norm(f"OND_{ond_no - 2}")
+                partial_key = _norm(f"OND_{ond_no - 1}")
+                prev_amt = old_ond_credit.get(credit_key)
+                partial_debit = next(
+                    (i for i in less2_all if _norm(i.get("utr", "")) == partial_key),
+                    None,
+                )
+                if not prev_amt or partial_debit is None:
+                    prev_amt = None
+                    partial_debit = None
+            if not prev_amt:
+                # The previous BRS may carry the on-demand credit with no
+                # reference at all (just an amount, e.g. 28,27,000 on 27.09
+                # taken back today as OND_5948162 -28,28,667.93). Accept a
+                # single unlabelled carried-forward credit that sits just
+                # below the debit by a typical on-demand charge (<= 0.2%).
+                _debit_amt = abs(float(row.get("Amount(Net)", 0.0) or 0.0))
+                _unlabelled = [
+                    i for i in cnb_cf
+                    if not str(i.get("utr", "") or "").strip()
+                    and not str(i.get("party", "") or "").strip()
+                    and id(i) not in _ond_completed_credit_items
+                    and 0 < _debit_amt - float(i.get("amount", 0.0) or 0.0)
+                    <= 0.002 * float(i.get("amount", 0.0) or 0.0)
+                ]
+                if len(_unlabelled) != 1:
+                    continue
+                prev_amt = float(_unlabelled[0].get("amount", 0.0) or 0.0)
+                _ond_completed_credit_items.add(id(_unlabelled[0]))
+                credit_key = None
+            debited = abs(float(row.get("Amount(Net)", 0.0) or 0.0))
+            if partial_debit is not None:
+                debited += float(partial_debit.get("amount", 0.0) or 0.0)
+            charge = round(debited - prev_amt, 2)
             if charge <= 0:
                 continue
+            if credit_key:
+                _ond_completed_credit_keys.add(credit_key)
+            if partial_debit is not None:
+                less2_all.remove(partial_debit)
+                less2_ids.discard(_norm(partial_debit.get("utr", "")))
             dt = _coerce_ts(row.get("AddedOn"))
             _add_less2(dict(
                 date=dt.strftime("%d.%m.%Y") if dt is not None and not pd.isna(dt) else BRS_DATE,
@@ -3699,6 +3799,39 @@ def process_gateway_files(
             item for item in dnc_all
             if not _matches_section_by_name_amount(item, resolved_cnb_cf, amount_tol=100.0)
         ]
+    # A bill booked today for a credit that already sat in the previous BRS
+    # as CNB (e.g. MEGHA 64,636 DLHI, credited 26.09, billed 28.09) must
+    # stay in DNC so "current DNC vs previous CNB" clears the pair. The
+    # gateway-pool check above can drop such a bill on a loose name match
+    # with some other gateway txn, leaving the old CNB credit counted twice.
+    if cnb_cf:
+        _dnc_bill_keys = {_norm(i.get("utr", "")) for i in dnc_all} - {""}
+        _cf_claimed = set()
+        for _, _row in ps_all[ps_all["date"].dt.strftime("%d.%m.%Y") == BRS_DATE].iterrows():
+            _bill = str(_row.get("bill_no", "")).strip()
+            if not _bill or _norm(_bill) in _dnc_bill_keys:
+                continue
+            _book_item = dict(
+                date=BRS_DATE,
+                branch=str(_row.get("branch", "")).strip(),
+                utr=_bill,
+                party=f"INDIVI - {str(_row.get('party', '')).strip()}".strip(),
+                amount=float(_row.get("amount", 0.0) or 0.0),
+                remark="Gateway cheque-style deposit pending bank credit",
+                gateway="PAYU",
+                cf=False, _auto=True,
+            )
+            _cf_hits = [
+                c for c in cnb_cf
+                if id(c) not in _cf_claimed
+                and abs(float(c.get("amount", 0.0) or 0.0) - _book_item["amount"]) <= 1.0
+                and _split_match_score(_book_item, c) >= 70
+            ]
+            if len(_cf_hits) != 1:
+                continue
+            _cf_claimed.add(id(_cf_hits[0]))
+            dnc_all.append(_book_item)
+            _dnc_bill_keys.add(_norm(_bill))
     # Fold in the settlement-level DNC items computed per gateway above
     # (PayU / PayU On-Demand / CashFree / EaseBuzz settlements that haven't
     # fully hit the bank yet). These were being computed into `all_dnc_new`
@@ -3734,9 +3867,18 @@ def process_gateway_files(
     _ond_cnb_items = [i for i in all_cnb_new if i.get("gateway") == "OND"]
     _non_ond_cnb   = [i for i in all_cnb_new if i.get("gateway") != "OND"]
     
+    # Without an on-demand file, a carried-forward on-demand credit leaves
+    # CNB only once PayU has taken it back (cycle completed above).
+    # Dropping it unconditionally lost OND_5942769 (+47,00,000) while its
+    # partial reversal OND_5942770 stayed in Less2. With an on-demand file
+    # the previous behaviour (always drop) is kept.
     cnb_cf = [
         i for i in cnb_cf
-        if not str(i.get("utr", "")).strip().upper().startswith("OND_")
+        if id(i) not in _ond_completed_credit_items
+        and not (
+            str(i.get("utr", "")).strip().upper().startswith("OND_")
+            and (PAYU_OD_FILES or _norm(i.get("utr", "")) in _ond_completed_credit_keys)
+        )
     ]
     cf_utrs_cnb     = {_norm(i["utr"]) for i in cnb_cf}
     all_cnb_combined = _non_ond_cnb
@@ -3745,7 +3887,49 @@ def process_gateway_files(
         if _norm(i["utr"]) not in cf_utrs_cnb
     ] + _ond_cnb_items
     cnb_ids = {_norm(i["utr"]) for i in cnb_all} - {""}
-    
+
+    # The book-style DNC builder decides whether a book bill is already
+    # covered by a gateway txn using the bank-verified payer name
+    # (_gateway_party_for_name_match), but the auto-CNB passes below only
+    # checked the gateway's self-entered customer name against the book.
+    # The two disagreed whenever a third party paid:
+    #   * self-entered name matches the book, bank name doesn't -> bill kept
+    #     in DNC while the txn was treated as "booked" and kept out of CNB,
+    #     so the credit vanished from the BRS (e.g. "Soujanya Naik" paid
+    #     from SOUJANYA BHEEMSING N's account);
+    #   * bank name matches the book, self-entered name doesn't -> bill
+    #     dropped from DNC as credited, yet the same txn was ALSO added to
+    #     CNB, counting it twice (e.g. KURAPATI VINEETHA entered as
+    #     "Pradeep").
+    def _dnc_has_party_amount(party, amount):
+        amt = round(float(amount or 0.0), 2)
+        if amt <= 0 or not str(party or "").strip():
+            return False
+        for d in list(dnc_all) + list(dnc_cf):
+            d_amt = round(float(d.get("amount", 0.0) or 0.0), 2)
+            if abs(d_amt - amt) > 1.0:
+                continue
+            text = f"{d.get('utr', '')} {d.get('party', '')}"
+            evidence = [dict(text=text, text_norm=_normalise_ref_token(text), amounts={d_amt})]
+            if _book_has_party_amount(evidence, party, amt):
+                return True
+        return False
+
+    def _bill_still_in_dnc(item):
+        return any(
+            _dnc_has_party_amount(name, item.get("amount", 0.0))
+            for name in (item.get("party", ""), item.get("pg_party", ""))
+        )
+
+    def _book_resolved_by_bank_name(item):
+        bank_name = str(item.get("pg_party", "") or "").strip()
+        if not bank_name:
+            return False
+        return (
+            _book_has_party_amount(book_evidence_rows, bank_name, item.get("amount", 0.0))
+            and not _bill_still_in_dnc(item)
+        )
+
     matched_payu_utrs = {_norm(r["UTR"]) for r in payu_brs if float(r.get("Bank_Credit", 0.0) or 0.0) > 0}
     _auto_cnb_added = 0
     if not payu_suc.empty:
@@ -3780,7 +3964,9 @@ def process_gateway_files(
                 gateway="PAYU-GW",
                 cf=False, _auto=True,
             )
-            if amt > 100 and _is_book_resolved(item, book_evidence_rows):
+            if amt > 100 and _is_book_resolved(item, book_evidence_rows) and not _bill_still_in_dnc(item):
+                continue
+            if amt > 100 and _book_resolved_by_bank_name(item):
                 continue
             cnb_all.append(item)
             cnb_ids.add(_norm(txn_id))
@@ -3855,7 +4041,9 @@ def process_gateway_files(
                 gateway="CASHFREE-GW",
                 cf=False, _auto=True,
             )
-            if _is_book_resolved(item, book_evidence_rows):
+            if _is_book_resolved(item, book_evidence_rows) and not _bill_still_in_dnc(item):
+                continue
+            if _book_resolved_by_bank_name(item):
                 continue
             cnb_all.append(item)
             cnb_ids.add(_norm(txn_id))
@@ -3925,7 +4113,10 @@ def process_gateway_files(
             # counterpart to clear it against.
             _matches_section_by_name_amount(item, dnc_all, amount_tol=100.0)
             or _matches_section_by_name_amount(item, dnc_cf, amount_tol=100.0)
+            or _bill_still_in_dnc(item)
         ):
+            continue
+        if _book_resolved_by_bank_name(item):
             continue
         cnb_all.append(item)
         cnb_ids.add(_norm(txn_id))
@@ -3967,7 +4158,10 @@ def process_gateway_files(
         if _is_book_resolved(item, book_evidence_rows) and not (
             _matches_section_by_name_amount(item, dnc_all, amount_tol=100.0)
             or _matches_section_by_name_amount(item, dnc_cf, amount_tol=100.0)
+            or _bill_still_in_dnc(item)
         ):
+            continue
+        if _book_resolved_by_bank_name(item):
             continue
         cnb_all.append(item)
         cnb_ids.add(_norm(txn_id))
@@ -4006,6 +4200,83 @@ def process_gateway_files(
         name_thresh=70,
         matches=backdated_credit_matches,
     )
+
+    # Third-party payments: a customer's book bill is often paid from a
+    # relative's / friend's account, so neither the gateway's self-entered
+    # name nor the bank-verified name resembles the book party (e.g. bill
+    # "CHIDELLA SUREKHA" 22,215 BANW paid by "M ROHIT KUMAR" 22,215 BANW).
+    # The name-based passes above can't pair these, leaving the same money
+    # on both sides of the BRS. Pair them on exact amount + same branch
+    # within a week -- but only when that (branch, amount) is unambiguous,
+    # i.e. exactly one open DNC bill and one open gateway credit share it.
+    _AB_GENERIC_BRANCHES = {"", "PAYU", "HOT", "CASHFREE", "EASEBUZZ", "SMARTPAY", "TEST"}
+
+    def _ab_bank_eligible(item):
+        utr = str(item.get("utr", "") or "").strip().upper()
+        gw = str(item.get("gateway", "") or "").strip().upper()
+        if not utr or utr.startswith("OND_"):
+            return False
+        return not any(tag in gw for tag in ("RTGS", "NEFT", "IMPS", "OND", "REFUND", "CHARGE"))
+
+    def _ab_key(item):
+        branch = str(item.get("branch", "") or "").strip().upper()
+        amt = round(float(item.get("amount", 0.0) or 0.0))
+        if branch in _AB_GENERIC_BRANCHES or amt <= 0:
+            return None
+        return (branch, amt)
+
+    _ab_book_pools = {"current": dnc_all, "previous": dnc_cf}
+    _ab_bank_pools = {"current": _current_cnb_items, "previous": _prev_cnb_items}
+    _ab_books = {}
+    _ab_banks = {}
+    for _pool_name, _pool in _ab_book_pools.items():
+        for _idx, _item in enumerate(_pool):
+            _key = _ab_key(_item)
+            if _key and str(_item.get("utr", "") or "").strip():
+                _ab_books.setdefault(_key, []).append((_pool_name, _idx))
+    for _pool_name, _pool in _ab_bank_pools.items():
+        for _idx, _item in enumerate(_pool):
+            _key = _ab_key(_item)
+            if _key and _ab_bank_eligible(_item):
+                _ab_banks.setdefault(_key, []).append((_pool_name, _idx))
+    _ab_cleared = {name: set() for name in ("book:current", "book:previous", "bank:current", "bank:previous")}
+    for _key, _book_refs in _ab_books.items():
+        _bank_refs = _ab_banks.get(_key, [])
+        if len(_book_refs) != 1 or len(_bank_refs) != 1:
+            continue
+        (_book_pool, _book_idx), = _book_refs
+        (_bank_pool, _bank_idx), = _bank_refs
+        if _book_pool == "previous" and _bank_pool == "previous":
+            continue  # both were already open together in the previous BRS
+        _book_item = _ab_book_pools[_book_pool][_book_idx]
+        _bank_item = _ab_bank_pools[_bank_pool][_bank_idx]
+        if not _same_day_or_open(_book_item, _bank_item, max_days=7):
+            continue
+        _label = {
+            ("current", "current"): "same-day DNC/CNB",
+            ("current", "previous"): "current DNC vs previous CNB",
+            ("previous", "current"): "previous DNC vs current CNB",
+        }[(_book_pool, _bank_pool)]
+        _ab_cleared[f"book:{_book_pool}"].add(_book_idx)
+        _ab_cleared[f"bank:{_bank_pool}"].add(_bank_idx)
+        backdated_credit_matches.append(dict(
+            label=_label,
+            book_items=[_book_item],
+            bank_items=[_bank_item],
+            diff=float(_book_item.get("amount", 0.0) or 0.0) - float(_bank_item.get("amount", 0.0) or 0.0),
+            basis="amount+branch",
+        ))
+        print(
+            f"[AMOUNT-BRANCH-CLEAR] {_label}: {_book_item.get('utr','')} "
+            f"{_book_item.get('party','')} <-> {_bank_item.get('utr','')} "
+            f"{_bank_item.get('party','')} {_key[0]} {float(_bank_item.get('amount',0.0) or 0.0):,.2f}"
+        )
+    if any(_ab_cleared.values()):
+        dnc_all = [i for n, i in enumerate(dnc_all) if n not in _ab_cleared["book:current"]]
+        dnc_cf = [i for n, i in enumerate(dnc_cf) if n not in _ab_cleared["book:previous"]]
+        _current_cnb_items = [i for n, i in enumerate(_current_cnb_items) if n not in _ab_cleared["bank:current"]]
+        _prev_cnb_items = [i for n, i in enumerate(_prev_cnb_items) if n not in _ab_cleared["bank:previous"]]
+
     if dnc_cf:
         _existing_dnc_keys = {_section_key(item) for item in dnc_all}
         _prev_dnc_pending = []
@@ -4115,6 +4386,16 @@ def process_gateway_files(
             gross_amt = round(float(row.get("Amount", 0.0) or 0.0), 2)
             has_cnb_pair = _matches_section_by_name_amount(probe, cnb_all, amount_tol=1.0)
             if not has_cnb_pair:
+                # The refund row carries the self-entered PayU name while a
+                # carried-forward CNB row often carries the bank-verified
+                # name instead (e.g. "Tejasvi Jain" vs "LAKSHRAJ M") -- the
+                # same transaction ID with the same amount is the same txn.
+                has_cnb_pair = any(
+                    _norm(c.get("utr", "")) == _norm(utr)
+                    and abs(float(c.get("amount", 0.0) or 0.0) - refund_amt) <= 1.0
+                    for c in cnb_all
+                )
+            if not has_cnb_pair:
                 # No existing CNB entry to pair against -- this is the
                 # "test payment" pattern (e.g. a Rs 5/Rs 7 gateway test that
                 # gets refunded immediately): the row's own Amount(Net) is
@@ -4177,6 +4458,91 @@ def process_gateway_files(
                 cf=False, _auto=True,
             ))
 
+    # Same treatment for CashFree: a refund event in the reconciliation
+    # detail is netted out of a settlement the bank has credited, i.e. it is
+    # a real bank debit our book hasn't recorded. Like the PayU refunds
+    # above, it is only listed when the original credit is sitting in CNB
+    # (matched by transaction ID), so the CNB (+) and Less2 (-) entries
+    # cancel out instead of shifting the balance.
+    _cf_refund_details = (
+        df_cf.attrs.get("cashfree_detail_rows", []) if isinstance(df_cf, pd.DataFrame) else []
+    )
+    for detail in _cf_refund_details:
+        if "REFUND" not in str(detail.get("event_type", "")).upper():
+            continue
+        if any(bad in str(detail.get("status", "")).upper() for bad in ("FAIL", "CANCEL", "REVERS")):
+            continue
+        settlement_utr = _norm(detail.get("utr", ""))
+        if not settlement_utr or settlement_utr not in matched_cf_utrs:
+            continue
+        refund_amt = round(abs(float(detail.get("settlement_amount", 0.0) or detail.get("amount", 0.0) or 0.0)), 2)
+        if refund_amt <= 0:
+            continue
+        settle_dt = _coerce_ts(detail.get("settlement_date"))
+        if settle_dt is not None and not pd.isna(settle_dt) and settle_dt.normalize() > brs_dt_ts.normalize():
+            continue
+        refs = {
+            _norm(detail.get(k, ""))
+            for k in ("merchant_ref", "customer_ref", "cashfree_ref")
+        } - {""}
+        cnb_pair = next(
+            (
+                c for c in cnb_all
+                if _norm(c.get("utr", "")) in refs
+                and abs(float(c.get("amount", 0.0) or 0.0) - refund_amt) <= 1.0
+            ),
+            None,
+        )
+        if cnb_pair is None:
+            continue
+        refund_key = f"{cnb_pair.get('utr', '')}-REFUND"
+        if _norm(refund_key) in less2_ids:
+            continue
+        # Date the refund by when the bank actually received that settlement
+        # (the detail's own date column can resolve to "Processed On").
+        _add_less2(dict(
+            date=(
+                _fmt_bank_settlement_date(detail.get("utr", ""))
+                or (settle_dt.strftime("%d.%m.%Y") if settle_dt is not None and not pd.isna(settle_dt) else BRS_DATE)
+            ),
+            branch=cnb_pair.get("branch", "") or "CASHFREE",
+            utr=refund_key,
+            party=str(detail.get("customer_name", "") or cnb_pair.get("party", "") or "CASHFREE").strip(),
+            amount=refund_amt,
+            remark="CashFree refund -- debited in bank, not in book",
+            gateway="CASHFREE-REFUND",
+            cf=False, _auto=True,
+        ))
+
+    # PayU charges actually netted out of a settlement (row Amount(Net) below
+    # Amount, e.g. the ADP payout: bills 2,39,741 + 1,93,582 cleared at gross,
+    # bank/book received 4,33,205). The book records only the net, so the
+    # deducted charge is a bank-side debit not in the book -- the same
+    # treatment as the "ADP PAYU CHARGES AND P&L" line in the manual BRS.
+    if not payu_suc.empty:
+        _payu_pos = payu_suc[
+            pd.to_numeric(payu_suc.get("Amount(Net)", pd.Series(dtype=float)), errors="coerce").fillna(0) > 0
+        ]
+        for _settle_utr, _grp in _payu_pos.groupby("Merchant UTR"):
+            if _norm(_settle_utr) not in matched_payu_utrs:
+                continue
+            _deducted = round(float(
+                (pd.to_numeric(_grp["Amount"], errors="coerce").fillna(0)
+                 - pd.to_numeric(_grp["Amount(Net)"], errors="coerce").fillna(0)).sum()
+            ), 2)
+            if _deducted < 1:
+                continue
+            _add_less2(dict(
+                date=_fmt_bank_settlement_date(_settle_utr) or BRS_DATE,
+                branch="PAYU",
+                utr=f"{_settle_utr}-CHARGES",
+                party="PAYU CHARGES",
+                amount=_deducted,
+                remark="PayU charges deducted from settlement -- debited in bank, not in book",
+                gateway="PAYU-CHARGE",
+                cf=False, _auto=True,
+            ))
+
     # The book's own "Receipts" (folded into dnc_all above via the ps_all
     # extension) and "Payments" rows sometimes represent the exact same
     # cheque on both sides -- money received, then immediately
@@ -4219,6 +4585,44 @@ def process_gateway_files(
             gateway="BOOK",
             cf=False, _auto=True,
         ))
+
+    # A refund carried in Less2 from the previous BRS ("debited in bank, not
+    # in book") is closed once the branch books that refund as a genuine
+    # Payment today -- e.g. HETAL MANISH SHAH 2,519: refunded 25.09, booked
+    # 28.09 as receipt PT-6500208 + matching cheque-issued payment. The
+    # receipt already clears the carried CNB credit; without this the
+    # carried refund debit stayed in Less2 and left the BRS 2,519 short.
+    _add1_pay_keys = {_norm(i.get("utr", "")) for i in add1_all} - {""}
+    _less2_cf_ids = {id(i) for i in less2_cf}
+    for _pay in genuine_payment_rows:
+        _pay_amt = round(float(_pay.get("amount", 0.0) or 0.0), 2)
+        _pay_dt = _pay.get("date")
+        if _pay_amt <= 0 or _pay_dt is None or pd.isna(_pay_dt):
+            continue
+        if _pay_dt.strftime("%d.%m.%Y") != BRS_DATE:
+            continue
+        if _norm(_pay.get("bill_no", "")) in _add1_pay_keys:
+            continue  # already paired with a DNC receipt above
+        _probe = dict(party=_pay.get("party", ""), amount=_pay_amt)
+        _hits = [
+            i for i in less2_all
+            if id(i) in _less2_cf_ids
+            and abs(float(i.get("amount", 0.0) or 0.0) - _pay_amt) <= 1.0
+            and (
+                _matches_section_by_name_amount(_probe, [i], amount_tol=1.0)
+                or _matches_section_by_name_amount(
+                    dict(_probe), [dict(i, party=i.get("pg_party", ""))], amount_tol=1.0
+                )
+            )
+        ]
+        if len(_hits) != 1:
+            continue
+        less2_all.remove(_hits[0])
+        less2_ids.discard(_norm(_hits[0].get("utr", "")))
+        print(
+            f"[CF-CLOSE] Less2 refund booked today: {_hits[0].get('utr', '')} | "
+            f"{_hits[0].get('party', '')} | {_pay_amt:,.2f} ({_pay.get('bill_no', '')})"
+        )
 
     # A settlement-level "not found in bank" item lumps ALL of that
     # settlement's individual transactions into one amount. If some of those
@@ -4375,6 +4779,15 @@ def process_gateway_files(
     prelim_total_less2 = sum(i["amount"] for i in less2_all)
     prelim_total_cnb   = sum(i["amount"] for i in cnb_all)
     prelim_bank_bal = closing_bal + prelim_total_add1 - prelim_total_dnc - prelim_total_less2 + prelim_total_cnb
+    # Gateway txns already used to clear a DNC bill (backdated/split/
+    # amount+branch pairs) have left both cnb_ids and DNC, so the balancing
+    # passes below would otherwise see them as "free" and add them to CNB a
+    # second time just to push the residual to zero.
+    _consumed_bank_refs = {
+        _norm(b.get("utr", ""))
+        for m in backdated_credit_matches
+        for b in (m.get("bank_items", []) or [])
+    } - {""}
     if prelim_bank_bal < -5000 and not payu_suc.empty:
         rescue_candidates = []
         today_ps_amounts = [
@@ -4393,7 +4806,7 @@ def process_gateway_files(
             amt = float(row.get("Amount", 0.0) or 0.0)
             if not txn_id or amt <= 0 or settle_utr not in matched_payu_utrs:
                 continue
-            if _norm(txn_id) in cnb_ids or _norm(txn_id) in less2_ids:
+            if _norm(txn_id) in cnb_ids or _norm(txn_id) in less2_ids or _norm(txn_id) in _consumed_bank_refs:
                 continue
             added_on = _coerce_ts(row.get("AddedOn"))
             if added_on is None or pd.isna(added_on) or added_on.normalize() > brs_dt_ts.normalize():
@@ -4444,7 +4857,7 @@ def process_gateway_files(
             amt = float(row.get("Amount", 0.0) or 0.0)
             if not txn_id or amt <= 0 or settle_utr not in matched_payu_utrs:
                 continue
-            if _norm(txn_id) in cnb_ids or _norm(txn_id) in less2_ids:
+            if _norm(txn_id) in cnb_ids or _norm(txn_id) in less2_ids or _norm(txn_id) in _consumed_bank_refs:
                 continue
             added_on = _coerce_ts(row.get("AddedOn"))
             if added_on is None or pd.isna(added_on) or added_on.normalize() > brs_dt_ts.normalize():
@@ -4727,9 +5140,16 @@ def process_gateway_files(
     bill_to_bank_date = {}
     bill_to_bank_ref  = {}
     backdated_credit_by_bill = {}
+    # Today's bills cleared against today's gateway credits inside the BRS
+    # ("same-day DNC/CNB"). Without this the Matched sheet re-ran its own
+    # name match for them, failed whenever a third party paid, and reported
+    # the bill UNMATCHED even though the BRS had already cleared it -- so it
+    # showed up in neither the Matched sheet nor the BRS.
+    same_day_credit_by_bill = {}
     for match in backdated_credit_matches:
-        if match.get("label") != "current DNC vs previous CNB":
+        if match.get("label") not in ("current DNC vs previous CNB", "same-day DNC/CNB"):
             continue
+        _is_same_day = match.get("label") == "same-day DNC/CNB"
         bank_items = match.get("bank_items", []) or []
         if not bank_items:
             continue
@@ -4760,7 +5180,7 @@ def process_gateway_files(
                 continue
             book_branch = str(book_item.get("branch", "")).strip()
             key = _bill_key(book_branch, bill, book_item.get("amount"))
-            backdated_credit_by_bill[key] = dict(
+            _pair_info = dict(
                 date=" / ".join(dict.fromkeys(bank_dates)),
                 ref=" / ".join(dict.fromkeys(bank_refs)),
                 party=" / ".join(dict.fromkeys(bank_party)),
@@ -4769,7 +5189,14 @@ def process_gateway_files(
                 branch=" / ".join(dict.fromkeys(bank_branches)),
                 amount=bank_amount,
                 diff=match.get("diff", 0.0) or 0.0,
+                basis=match.get("basis", ""),
             )
+            if _is_same_day:
+                same_day_credit_by_bill[key] = _pair_info
+                bill_to_bank_date.setdefault(key, _pair_info["date"])
+                bill_to_bank_ref.setdefault(key, _pair_info["ref"])
+                continue
+            backdated_credit_by_bill[key] = _pair_info
             bill_to_bank_date[key] = backdated_credit_by_bill[key]["date"]
             bill_to_bank_ref[key] = backdated_credit_by_bill[key]["ref"]
     for txn in bank_txns:
@@ -4996,6 +5423,36 @@ def process_gateway_files(
             total_order_status=info.get("total_order_status") or info.get("order_status", ""),
         )
 
+    def _amount_branch_match_rec(info, bill, ps_party, ps_amount, book_date_str, how):
+        # Bill cleared in the BRS on exact amount + same branch (third-party
+        # payer, names don't match) -- show the pair, flagged for review.
+        nm_score = max(
+            _name_match_score(ps_party, info.get("pg_party", "")),
+            _name_match_score(ps_party, info.get("party", "")),
+        )
+        amt_diff = ps_amount - float(info.get("amount", 0.0) or 0.0)
+        return dict(
+            book_date=book_date_str,
+            book_bill=bill,
+            book_party="INDIVI - " + ps_party,
+            book_amount=ps_amount,
+            bank_date=info.get("date", ""),
+            bank_ref=info.get("ref", ""),
+            bank_amount=float(info.get("amount", 0.0) or 0.0),
+            bank_party=info.get("pg_party", "") or info.get("party", ""),
+            pg_party=info.get("party", ""),
+            gateway=info.get("gateway", ""),
+            total_order_branch=info.get("branch", ""),
+            name_score=nm_score,
+            name_label="AMOUNT+BRANCH",
+            amount_diff=abs(amt_diff),
+            verdict="REVIEW",
+            verdict_reason=(
+                f"{how} on exact amount + same branch -- payer "
+                f"'{info.get('pg_party', '') or info.get('party', '')}' differs from book party, verify"
+            ),
+        )
+
     for _, ps_row in ps_all.iterrows():
         bill      = ps_row["bill_no"]
         ps_party  = str(ps_row["party"])
@@ -5005,6 +5462,12 @@ def process_gateway_files(
         bill_key  = _bill_key(ps_row["branch"], bill, ps_amount)
 
         # ── Priority 1: Direct bill-number match in bank statement ────────────
+        if bill_key in backdated_credit_by_bill and backdated_credit_by_bill[bill_key].get("basis") == "amount+branch":
+            cheque_match_report.append(_amount_branch_match_rec(
+                backdated_credit_by_bill[bill_key], bill, ps_party, ps_amount, book_date_str,
+                "Backdated credit cleared against previous BRS CNB",
+            ))
+            continue
         if bill_key in backdated_credit_by_bill:
             backdated = backdated_credit_by_bill[bill_key]
             amt_diff = ps_amount - float(backdated.get("amount", 0.0) or 0.0)
@@ -5105,6 +5568,13 @@ def process_gateway_files(
                 ))
             continue
 
+        if bill_key in same_day_credit_by_bill and same_day_credit_by_bill[bill_key].get("basis") == "amount+branch":
+            cheque_match_report.append(_amount_branch_match_rec(
+                same_day_credit_by_bill[bill_key], bill, ps_party, ps_amount, book_date_str,
+                "Cleared in BRS against same-day gateway credit",
+            ))
+            continue
+
         # ── Priority 2: Name + Amount match against gateway transactions ──────
         # Score = name_match_score + bonuses for exact amount, date proximity
         best_gw = None; best_gw_score = 0; best_nm_label = ""; best_nm_score = 0
@@ -5179,6 +5649,38 @@ def process_gateway_files(
                     f"'{best_gw['party']}' - verify before confirming"
                 ),
                 **_gateway_order_fields(best_gw),
+            ))
+        elif bill_key in same_day_credit_by_bill:
+            # The BRS already cleared this bill against a same-day gateway
+            # credit (see same_day_credit_by_bill above) -- report that pair
+            # instead of calling the bill UNMATCHED.
+            same_day = same_day_credit_by_bill[bill_key]
+            amt_diff = ps_amount - float(same_day.get("amount", 0.0) or 0.0)
+            nm_score = max(
+                _name_match_score(ps_party, same_day.get("pg_party", "")),
+                _name_match_score(ps_party, same_day.get("party", "")),
+            )
+            cheque_match_report.append(dict(
+                book_date=book_date_str,
+                book_bill=bill,
+                book_party="INDIVI - " + ps_party,
+                book_amount=ps_amount,
+                bank_date=same_day.get("date", ""),
+                bank_ref=same_day.get("ref", ""),
+                bank_amount=float(same_day.get("amount", 0.0) or 0.0),
+                bank_party=same_day.get("pg_party", "") or same_day.get("party", ""),
+                pg_party=same_day.get("party", ""),
+                gateway=same_day.get("gateway", ""),
+                total_order_branch=same_day.get("branch", ""),
+                name_score=nm_score,
+                name_label="SAME_DAY_CLEAR",
+                amount_diff=abs(amt_diff),
+                verdict="REVIEW",
+                verdict_reason=(
+                    f"Cleared in BRS against same-day {same_day.get('gateway', '')} credit "
+                    f"'{same_day.get('party', '')}' - verify"
+                    + (f" | Amt diff Rs {amt_diff:+,.2f}" if abs(amt_diff) >= 1 else "")
+                ),
             ))
         else:
             cheque_match_report.append(dict(
@@ -5733,6 +6235,14 @@ def process_gateway_files(
         bill_norm = _norm(bill)
         gw_match  = _best_gateway_match(row["party"], row["amount"])
         gw_name   = _clean_gateway_display(gw_match.get("gateway", "")) if gw_match else _clean_gateway_display(_resolve_gateway(row["party"], row["amount"]))
+        # Bills the BRS cleared against a same-day gateway credit (third-party
+        # payer, so the name lookups above find nothing) -- take the gateway
+        # and order reference from the credit they were cleared against.
+        same_day_pair = same_day_credit_by_bill.get(bill_key, {})
+        if not gw_name and same_day_pair:
+            gw_name = _clean_gateway_display(same_day_pair.get("gateway", ""))
+        if not gw_txn and same_day_pair:
+            gw_txn = str(same_day_pair.get("ref", "") or "").strip()
         if not gw_txn and gw_match:
             gw_txn = str(gw_match.get("ref", "") or "").strip()
         gw_date   = _fmt_gateway_date(gw_match.get("date")) if gw_match else ""
@@ -5752,6 +6262,8 @@ def process_gateway_files(
             # The real transaction/order reference is already sitting right
             # there as `ref`; use that directly instead of the dead fallback.
             order_no = str(gw_match.get("ref", "") or "").strip()
+        if not order_no and same_day_pair:
+            order_no = str(same_day_pair.get("ref", "") or "").strip()
         for c, v in enumerate(
                 [dt, row["branch"], "GATEWAY", bill, 511, party,
                  row["amount"], gw_name, order_no, narration], 1):
@@ -5977,7 +6489,9 @@ def process_gateway_files(
         _write_gateway_format_values(ws6, r, [
             _fmt_bank_settlement_date(row.get("Merchant UTR", "")), _branch, _order_no,
             "PAYU", _name_at_bank, str(row.get("Customer Name", ""))[:40],
-            row.get("Amount", 0.0), "", _pay_type,
+            # Net amount (column D), so refunds/on-demand debits come through
+            # negative and the per-settlement total matches the bank credit.
+            row.get("Amount(Net)", 0.0), "", _pay_type,
         ])
         ws6.cell(r, 23, str(row.get("Merchant UTR", "") or "").strip())
     r = _separate_gateway_sets(ws6, 3, r, 23, 10, [3, 4, 5, 6, 19])
